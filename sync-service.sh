@@ -18,6 +18,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
+GRAY='\033[0;37m'
 NC='\033[0m'
 
 function write_service_log() {
@@ -151,21 +152,83 @@ function uninstall_sync_service() {
         exit 1
     fi
     
-    # 停止服务
+    # 步骤1: 停止服务
+    echo -e "${CYAN}步骤1: 停止服务${NC}"
     stop_sync_service
     
-    # 禁用服务
+    # 步骤2: 禁用服务
+    echo -e "${CYAN}步骤2: 禁用服务${NC}"
     systemctl disable "$SERVICE_NAME" 2>/dev/null
     
-    # 删除服务文件
+    # 步骤3: 删除服务文件
+    echo -e "${CYAN}步骤3: 删除systemd服务文件${NC}"
     if [ -f "$SERVICE_FILE" ]; then
         rm -f "$SERVICE_FILE"
+        echo -e "${GREEN}✓ 已删除服务文件: $SERVICE_FILE${NC}"
     fi
     
-    # 重新加载systemd配置
+    # 步骤4: 清理远程脚本
+    echo -e "${CYAN}步骤4: 清理远程服务器脚本${NC}"
+    
+    # 加载配置以获取远程服务器信息
+    if ! load_cached_config; then
+        load_config
+    fi
+    
+    if [ -n "$REMOTE_HOST" ]; then
+        local remote_script_path="/tmp/remote-sync-helper.sh"
+        echo -e "${YELLOW}正在清理远程服务器脚本...${NC}"
+        
+        # 删除远程脚本
+        if ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "rm -f $remote_script_path" 2>/dev/null; then
+            echo -e "${GREEN}✓ 已删除远程脚本: $REMOTE_HOST:$remote_script_path${NC}"
+        else
+            echo -e "${YELLOW}警告: 无法删除远程脚本或脚本不存在${NC}"
+        fi
+    else
+        echo -e "${YELLOW}跳过远程脚本清理（无有效配置）${NC}"
+    fi
+    
+    # 步骤5: 清理本地缓存和日志
+    echo -e "${CYAN}步骤5: 清理本地文件${NC}"
+    
+    # 删除配置缓存文件
+    if [ -f "$CONFIG_CACHE_FILE" ]; then
+        rm -f "$CONFIG_CACHE_FILE"
+        echo -e "${GREEN}✓ 已删除配置缓存: $CONFIG_CACHE_FILE${NC}"
+    fi
+    
+    # 删除PID文件
+    if [ -f "$PID_FILE" ]; then
+        rm -f "$PID_FILE"
+        echo -e "${GREEN}✓ 已删除PID文件: $PID_FILE${NC}"
+    fi
+    
+    # 询问是否删除日志文件
+    if [ -f "$LOG_FILE" ]; then
+        echo -e "${YELLOW}是否删除服务日志文件? $LOG_FILE (y/N): ${NC}"
+        read -r delete_log
+        if [[ "$delete_log" =~ ^[Yy]$ ]]; then
+            rm -f "$LOG_FILE"
+            echo -e "${GREEN}✓ 已删除日志文件: $LOG_FILE${NC}"
+        else
+            echo -e "${GRAY}保留日志文件: $LOG_FILE${NC}"
+        fi
+    fi
+    
+    # 步骤6: 重新加载systemd配置
+    echo -e "${CYAN}步骤6: 重新加载systemd配置${NC}"
     systemctl daemon-reload
     
-    write_service_log "服务卸载完成。"
+    echo ""
+    echo -e "${GREEN}=== 卸载完成 ===${NC}"
+    echo -e "${WHITE}已清理以下组件:${NC}"
+    echo -e "${WHITE}  ✓ systemd服务文件${NC}"
+    echo -e "${WHITE}  ✓ 远程助手脚本${NC}"
+    echo -e "${WHITE}  ✓ 配置缓存文件${NC}"
+    echo -e "${WHITE}  ✓ PID文件${NC}"
+    
+    write_service_log "服务卸载完成，已清理所有相关文件。"
 }
 
 function start_sync_service() {

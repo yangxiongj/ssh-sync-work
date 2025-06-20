@@ -1,15 +1,15 @@
 # 远程服务器配置
 remote:
-  host: 127.0.0.1
+  host: 34.68.158.244
   port: 22
   dir: /root/work
 
 # 同步目录配置
 directories:
-#  - /mnt/d/PycharmProjects/test
+  # - /mnt/d/PycharmProjects/test
 
 # 刷新间隔 (秒)
-refresh_interval: 60
+refresh_interval: 20
 
 # 排除模式配置
 exclude_patterns:
