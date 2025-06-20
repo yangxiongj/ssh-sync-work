@@ -1,0 +1,20 @@
+# 远程服务器配置
+remote:
+  host: "34.68.158.244"
+  port: 22
+  dir: "/root/work"
+
+# 同步目录配置
+directories:
+  - /mnt/d/PycharmProjects/searxng
+  - /mnt/d/PycharmProjects/fast-crawler
+
+# 刷新间隔 (秒)
+refresh_interval: 60
+
+# 排除模式配置
+exclude_patterns:
+  - '.git'
+  - '.idea'
+  - '__pycache__'
+  # 更多模式...

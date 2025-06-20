@@ -1,15 +1,15 @@
 #!/bin/bash
 
-# 基础配置
-REMOTE_HOST="34.68.158.244"
-REMOTE_PORT="22"
-LOCAL_DIRS=("/mnt/d/PycharmProjects/searxng" "/mnt/d/PycharmProjects/fast-crawler")
-REMOTE_DIR="/root/work"
-REFRESH_INTERVAL=60
+# 配置文件路径
+CONFIG_FILE="/mnt/d/sync.yaml"
 
-
-# 排除目录配置 - 可以根据需要修改
-EXCLUDE_PATTERNS=(
+# 默认配置 (当YAML文件不存在或解析失败时使用)
+DEFAULT_REMOTE_HOST="34.68.158.244"
+DEFAULT_REMOTE_PORT="22"
+DEFAULT_REMOTE_DIR="/root/work"
+DEFAULT_REFRESH_INTERVAL=60
+DEFAULT_LOCAL_DIRS=
+DEFAULT_EXCLUDE_PATTERNS=(
     '.git'
     '.gitignore'
     '.idea'
@@ -21,6 +21,18 @@ EXCLUDE_PATTERNS=(
     'target'
     'node_modules'
 )
+
+# 当前配置变量 (从YAML加载或使用默认值)
+REMOTE_HOST=""
+REMOTE_PORT=""
+REMOTE_DIR=""
+REFRESH_INTERVAL=""
+LOCAL_DIRS=()
+EXCLUDE_PATTERNS=()
+
+# 缓存变量
+CONFIG_TIMESTAMP=""
+CONFIG_CACHE_FILE="/tmp/sync_config_cache"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -46,6 +58,218 @@ function get_tar_exclude_args() {
         exclude_args+="--exclude='$pattern' "
     done
     echo "$exclude_args"
+}
+
+function load_config() {
+    # 检查配置文件是否存在
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}Configuration file not found: $CONFIG_FILE${NC}"
+        echo -e "${YELLOW}Using default configuration...${NC}"
+        load_default_config
+        return
+    fi
+
+    # 获取配置文件的时间戳
+    local current_timestamp=$(stat -c %Y "$CONFIG_FILE" 2>/dev/null)
+
+    # 检查是否有缓存且时间戳一致
+    if [ -f "$CONFIG_CACHE_FILE" ] && [ "$CONFIG_TIMESTAMP" = "$current_timestamp" ] && [ ${#LOCAL_DIRS[@]} -gt 0 ]; then
+        echo -e "${GRAY}Using cached configuration (timestamp: $current_timestamp)${NC}"
+        return
+    fi
+
+    echo -e "${CYAN}Loading configuration from $CONFIG_FILE (timestamp: $current_timestamp)${NC}"
+
+    # 先加载默认配置作为基础
+    load_default_config
+
+    # 清空数组配置
+    LOCAL_DIRS=()
+    EXCLUDE_PATTERNS=()
+
+    # YAML解析状态变量
+    local in_directories_section=false
+    local in_exclude_patterns_section=false
+    local in_remote_section=false
+
+    while IFS= read -r line; do
+        # 去除前后空格
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        # 跳过空行和注释
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+        # 检查顶级配置项
+        if [[ "$line" =~ ^remote: ]]; then
+            in_remote_section=true
+            in_directories_section=false
+            in_exclude_patterns_section=false
+            continue
+        elif [[ "$line" =~ ^directories: ]]; then
+            in_directories_section=true
+            in_remote_section=false
+            in_exclude_patterns_section=false
+            continue
+        elif [[ "$line" =~ ^exclude_patterns: ]]; then
+            in_exclude_patterns_section=true
+            in_directories_section=false
+            in_remote_section=false
+            continue
+        elif [[ "$line" =~ ^refresh_interval:[[:space:]]*([0-9]+) ]]; then
+            REFRESH_INTERVAL="${BASH_REMATCH[1]}"
+            echo -e "${GRAY}  Set refresh_interval: $REFRESH_INTERVAL${NC}"
+            in_directories_section=false
+            in_remote_section=false
+            in_exclude_patterns_section=false
+            continue
+        elif [[ "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*: ]]; then
+            # 其他顶级键，重置所有section标志
+            in_directories_section=false
+            in_remote_section=false
+            in_exclude_patterns_section=false
+            continue
+        fi
+
+        # 处理remote部分的配置
+        if [ "$in_remote_section" = true ]; then
+            if [[ "$line" =~ ^host:[[:space:]]*[\"\']*([^\"\']+)[\"\']*$ ]]; then
+                REMOTE_HOST="${BASH_REMATCH[1]}"
+                echo -e "${GRAY}  Set remote.host: $REMOTE_HOST${NC}"
+            elif [[ "$line" =~ ^port:[[:space:]]*([0-9]+) ]]; then
+                REMOTE_PORT="${BASH_REMATCH[1]}"
+                echo -e "${GRAY}  Set remote.port: $REMOTE_PORT${NC}"
+            elif [[ "$line" =~ ^dir:[[:space:]]*[\"\']*([^\"\']+)[\"\']*$ ]]; then
+                REMOTE_DIR="${BASH_REMATCH[1]}"
+                echo -e "${GRAY}  Set remote.dir: $REMOTE_DIR${NC}"
+            fi
+        fi
+
+        # 处理directories部分
+        if [ "$in_directories_section" = true ] && [[ "$line" =~ ^-[[:space:]]+ ]]; then
+            local dir_path=$(echo "$line" | sed 's/^-[[:space:]]*//' | sed 's/^["'\'']//' | sed 's/["'\'']*$//')
+            if [ -n "$dir_path" ]; then
+                LOCAL_DIRS+=("$dir_path")
+                echo -e "${GRAY}  Added directory: $dir_path${NC}"
+            fi
+        fi
+
+        # 处理exclude_patterns部分
+        if [ "$in_exclude_patterns_section" = true ] && [[ "$line" =~ ^-[[:space:]]+ ]]; then
+            local pattern=$(echo "$line" | sed 's/^-[[:space:]]*//' | sed 's/^["'\'']//' | sed 's/["'\'']*$//')
+            if [ -n "$pattern" ]; then
+                EXCLUDE_PATTERNS+=("$pattern")
+                echo -e "${GRAY}  Added exclude pattern: $pattern${NC}"
+            fi
+        fi
+
+    done < "$CONFIG_FILE"
+
+    # 更新时间戳缓存
+    CONFIG_TIMESTAMP="$current_timestamp"
+
+    # 保存到缓存文件
+    save_config_cache
+
+    # 验证配置
+    validate_config
+
+    echo -e "${GREEN}Configuration loaded successfully${NC}"
+    echo -e "${GRAY}  Remote: $REMOTE_HOST:$REMOTE_PORT$REMOTE_DIR${NC}"
+    echo -e "${GRAY}  Directories: ${#LOCAL_DIRS[@]}, Excludes: ${#EXCLUDE_PATTERNS[@]}, Interval: ${REFRESH_INTERVAL}s${NC}"
+}
+
+function load_default_config() {
+    REMOTE_HOST="$DEFAULT_REMOTE_HOST"
+    REMOTE_PORT="$DEFAULT_REMOTE_PORT"
+    REMOTE_DIR="$DEFAULT_REMOTE_DIR"
+    REFRESH_INTERVAL="$DEFAULT_REFRESH_INTERVAL"
+    LOCAL_DIRS=("${DEFAULT_LOCAL_DIRS[@]}")
+    EXCLUDE_PATTERNS=("${DEFAULT_EXCLUDE_PATTERNS[@]}")
+}
+
+function validate_config() {
+    # 如果关键配置为空，使用默认值
+    [ -z "$REMOTE_HOST" ] && REMOTE_HOST="$DEFAULT_REMOTE_HOST"
+    [ -z "$REMOTE_PORT" ] && REMOTE_PORT="$DEFAULT_REMOTE_PORT"
+    [ -z "$REMOTE_DIR" ] && REMOTE_DIR="$DEFAULT_REMOTE_DIR"
+    [ -z "$REFRESH_INTERVAL" ] && REFRESH_INTERVAL="$DEFAULT_REFRESH_INTERVAL"
+
+    # 如果数组为空，使用默认值
+    if [ ${#LOCAL_DIRS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No directories found in configuration, using defaults...${NC}"
+        LOCAL_DIRS=("${DEFAULT_LOCAL_DIRS[@]}")
+    fi
+
+    if [ ${#EXCLUDE_PATTERNS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No exclude patterns found in configuration, using defaults...${NC}"
+        EXCLUDE_PATTERNS=("${DEFAULT_EXCLUDE_PATTERNS[@]}")
+    fi
+}
+
+function save_config_cache() {
+    {
+        echo "CONFIG_TIMESTAMP=$CONFIG_TIMESTAMP"
+        echo "REMOTE_HOST=$REMOTE_HOST"
+        echo "REMOTE_PORT=$REMOTE_PORT"
+        echo "REMOTE_DIR=$REMOTE_DIR"
+        echo "REFRESH_INTERVAL=$REFRESH_INTERVAL"
+        for dir in "${LOCAL_DIRS[@]}"; do
+            echo "LOCAL_DIR=$dir"
+        done
+        for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+            echo "EXCLUDE_PATTERN=$pattern"
+        done
+    } > "$CONFIG_CACHE_FILE"
+}
+
+function load_cached_config() {
+    # 如果缓存文件存在，尝试加载缓存
+    if [ -f "$CONFIG_CACHE_FILE" ]; then
+        local cached_dirs=()
+        local cached_patterns=()
+        local cached_timestamp=""
+        local cached_host=""
+        local cached_port=""
+        local cached_dir=""
+        local cached_interval=""
+
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^CONFIG_TIMESTAMP= ]]; then
+                cached_timestamp="${line#CONFIG_TIMESTAMP=}"
+            elif [[ "$line" =~ ^REMOTE_HOST= ]]; then
+                cached_host="${line#REMOTE_HOST=}"
+            elif [[ "$line" =~ ^REMOTE_PORT= ]]; then
+                cached_port="${line#REMOTE_PORT=}"
+            elif [[ "$line" =~ ^REMOTE_DIR= ]]; then
+                cached_dir="${line#REMOTE_DIR=}"
+            elif [[ "$line" =~ ^REFRESH_INTERVAL= ]]; then
+                cached_interval="${line#REFRESH_INTERVAL=}"
+            elif [[ "$line" =~ ^LOCAL_DIR= ]]; then
+                cached_dirs+=("${line#LOCAL_DIR=}")
+            elif [[ "$line" =~ ^EXCLUDE_PATTERN= ]]; then
+                cached_patterns+=("${line#EXCLUDE_PATTERN=}")
+            fi
+        done < "$CONFIG_CACHE_FILE"
+
+        # 检查配置文件是否存在且时间戳一致
+        if [ -f "$CONFIG_FILE" ]; then
+            local current_timestamp=$(stat -c %Y "$CONFIG_FILE" 2>/dev/null)
+            if [ "$cached_timestamp" = "$current_timestamp" ] && [ ${#cached_dirs[@]} -gt 0 ]; then
+                # 加载所有缓存的配置
+                REMOTE_HOST="$cached_host"
+                REMOTE_PORT="$cached_port"
+                REMOTE_DIR="$cached_dir"
+                REFRESH_INTERVAL="$cached_interval"
+                LOCAL_DIRS=("${cached_dirs[@]}")
+                EXCLUDE_PATTERNS=("${cached_patterns[@]}")
+                CONFIG_TIMESTAMP="$cached_timestamp"
+
+                echo -e "${GRAY}Loaded cached configuration (${#LOCAL_DIRS[@]} dirs, ${#EXCLUDE_PATTERNS[@]} excludes)${NC}"
+                return 0
+            fi
+        fi
+    fi
+    return 1
 }
 
 
@@ -375,6 +599,11 @@ function cleanup() {
 # 设置信号处理
 trap cleanup SIGINT SIGTERM
 
+# 初始加载配置
+if ! load_cached_config; then
+    load_config
+fi
+
 # 显示配置信息
 show_config
 
@@ -383,6 +612,9 @@ echo -e "${GREEN}Git sync started. Press Ctrl+C to stop.${NC}"
 echo ""
 
 while true; do
+    # 每次循环前检查配置文件是否有变化
+    load_config
+
     sync_files
     echo -e "${GRAY}Next check in $REFRESH_INTERVAL seconds...${NC}"
     echo ""
