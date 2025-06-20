@@ -8,7 +8,7 @@ DEFAULT_REMOTE_HOST="34.68.158.244"
 DEFAULT_REMOTE_PORT="22"
 DEFAULT_REMOTE_DIR="/root/work"
 DEFAULT_REFRESH_INTERVAL=60
-DEFAULT_LOCAL_DIRS=
+DEFAULT_LOCAL_DIRS=("/mnt/d/PycharmProjects/searxng" "/mnt/d/PycharmProjects/fast-crawler")
 DEFAULT_EXCLUDE_PATTERNS=(
     '.git'
     '.gitignore'
@@ -33,6 +33,12 @@ EXCLUDE_PATTERNS=()
 # 缓存变量
 CONFIG_TIMESTAMP=""
 CONFIG_CACHE_FILE="/tmp/sync_config_cache"
+
+# 远程脚本配置
+REMOTE_SCRIPT_NAME="remote-sync-helper.sh"
+REMOTE_SCRIPT_PATH="/tmp/$REMOTE_SCRIPT_NAME"
+LOCAL_SCRIPT_PATH="./remote-sync-helper.sh"
+REMOTE_SCRIPT_UPLOADED=false
 
 # 颜色定义
 RED='\033[0;31m'
@@ -68,37 +74,37 @@ function load_config() {
         load_default_config
         return
     fi
-
+    
     # 获取配置文件的时间戳
     local current_timestamp=$(stat -c %Y "$CONFIG_FILE" 2>/dev/null)
-
+    
     # 检查是否有缓存且时间戳一致
     if [ -f "$CONFIG_CACHE_FILE" ] && [ "$CONFIG_TIMESTAMP" = "$current_timestamp" ] && [ ${#LOCAL_DIRS[@]} -gt 0 ]; then
         echo -e "${GRAY}Using cached configuration (timestamp: $current_timestamp)${NC}"
         return
     fi
-
-    echo -e "${CYAN}Loading configuration from $CONFIG_FILE (timestamp: $current_timestamp)${NC}"
-
+    
+    # 静默加载配置
+    
     # 先加载默认配置作为基础
     load_default_config
-
+    
     # 清空数组配置
     LOCAL_DIRS=()
     EXCLUDE_PATTERNS=()
-
+    
     # YAML解析状态变量
     local in_directories_section=false
     local in_exclude_patterns_section=false
     local in_remote_section=false
-
+    
     while IFS= read -r line; do
         # 去除前后空格
         line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-
+        
         # 跳过空行和注释
         [[ -z "$line" || "$line" =~ ^# ]] && continue
-
+        
         # 检查顶级配置项
         if [[ "$line" =~ ^remote: ]]; then
             in_remote_section=true
@@ -129,53 +135,46 @@ function load_config() {
             in_exclude_patterns_section=false
             continue
         fi
-
+        
         # 处理remote部分的配置
         if [ "$in_remote_section" = true ]; then
             if [[ "$line" =~ ^host:[[:space:]]*[\"\']*([^\"\']+)[\"\']*$ ]]; then
                 REMOTE_HOST="${BASH_REMATCH[1]}"
-                echo -e "${GRAY}  Set remote.host: $REMOTE_HOST${NC}"
             elif [[ "$line" =~ ^port:[[:space:]]*([0-9]+) ]]; then
                 REMOTE_PORT="${BASH_REMATCH[1]}"
-                echo -e "${GRAY}  Set remote.port: $REMOTE_PORT${NC}"
             elif [[ "$line" =~ ^dir:[[:space:]]*[\"\']*([^\"\']+)[\"\']*$ ]]; then
                 REMOTE_DIR="${BASH_REMATCH[1]}"
-                echo -e "${GRAY}  Set remote.dir: $REMOTE_DIR${NC}"
             fi
         fi
-
+        
         # 处理directories部分
         if [ "$in_directories_section" = true ] && [[ "$line" =~ ^-[[:space:]]+ ]]; then
             local dir_path=$(echo "$line" | sed 's/^-[[:space:]]*//' | sed 's/^["'\'']//' | sed 's/["'\'']*$//')
             if [ -n "$dir_path" ]; then
                 LOCAL_DIRS+=("$dir_path")
-                echo -e "${GRAY}  Added directory: $dir_path${NC}"
             fi
         fi
-
+        
         # 处理exclude_patterns部分
         if [ "$in_exclude_patterns_section" = true ] && [[ "$line" =~ ^-[[:space:]]+ ]]; then
             local pattern=$(echo "$line" | sed 's/^-[[:space:]]*//' | sed 's/^["'\'']//' | sed 's/["'\'']*$//')
             if [ -n "$pattern" ]; then
                 EXCLUDE_PATTERNS+=("$pattern")
-                echo -e "${GRAY}  Added exclude pattern: $pattern${NC}"
             fi
         fi
-
+        
     done < "$CONFIG_FILE"
-
+    
     # 更新时间戳缓存
     CONFIG_TIMESTAMP="$current_timestamp"
-
+    
     # 保存到缓存文件
     save_config_cache
-
+    
     # 验证配置
     validate_config
-
-    echo -e "${GREEN}Configuration loaded successfully${NC}"
-    echo -e "${GRAY}  Remote: $REMOTE_HOST:$REMOTE_PORT$REMOTE_DIR${NC}"
-    echo -e "${GRAY}  Directories: ${#LOCAL_DIRS[@]}, Excludes: ${#EXCLUDE_PATTERNS[@]}, Interval: ${REFRESH_INTERVAL}s${NC}"
+    
+    # 配置加载完成（静默）
 }
 
 function load_default_config() {
@@ -193,13 +192,13 @@ function validate_config() {
     [ -z "$REMOTE_PORT" ] && REMOTE_PORT="$DEFAULT_REMOTE_PORT"
     [ -z "$REMOTE_DIR" ] && REMOTE_DIR="$DEFAULT_REMOTE_DIR"
     [ -z "$REFRESH_INTERVAL" ] && REFRESH_INTERVAL="$DEFAULT_REFRESH_INTERVAL"
-
+    
     # 如果数组为空，使用默认值
     if [ ${#LOCAL_DIRS[@]} -eq 0 ]; then
         echo -e "${YELLOW}No directories found in configuration, using defaults...${NC}"
         LOCAL_DIRS=("${DEFAULT_LOCAL_DIRS[@]}")
     fi
-
+    
     if [ ${#EXCLUDE_PATTERNS[@]} -eq 0 ]; then
         echo -e "${YELLOW}No exclude patterns found in configuration, using defaults...${NC}"
         EXCLUDE_PATTERNS=("${DEFAULT_EXCLUDE_PATTERNS[@]}")
@@ -222,6 +221,44 @@ function save_config_cache() {
     } > "$CONFIG_CACHE_FILE"
 }
 
+function ensure_remote_script() {
+    # 如果已经确认存在，跳过检查
+    if [ "$REMOTE_SCRIPT_UPLOADED" = true ]; then
+        return 0
+    fi
+    
+    # 检查远程脚本是否存在
+    if ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "[ -x $REMOTE_SCRIPT_PATH ]" 2>/dev/null; then
+        REMOTE_SCRIPT_UPLOADED=true
+        return 0
+    fi
+    
+    # 远程脚本不存在，尝试上传
+    if [ ! -f "$LOCAL_SCRIPT_PATH" ]; then
+        echo -e "${RED}Remote helper script not found: $LOCAL_SCRIPT_PATH${NC}"
+        return 1
+    fi
+    
+    # 上传脚本到远程服务器（静默）
+    scp -P "$REMOTE_PORT" "$LOCAL_SCRIPT_PATH" "$REMOTE_HOST:$REMOTE_SCRIPT_PATH" 2>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "chmod +x $REMOTE_SCRIPT_PATH" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            REMOTE_SCRIPT_UPLOADED=true
+            return 0
+        else
+            echo -e "${RED}Failed to set script permissions${NC}"
+            return 1
+        fi
+    else
+        echo -e "${RED}Failed to upload remote script${NC}"
+        return 1
+    fi
+}
+
+
+
 function load_cached_config() {
     # 如果缓存文件存在，尝试加载缓存
     if [ -f "$CONFIG_CACHE_FILE" ]; then
@@ -232,7 +269,7 @@ function load_cached_config() {
         local cached_port=""
         local cached_dir=""
         local cached_interval=""
-
+        
         while IFS= read -r line; do
             if [[ "$line" =~ ^CONFIG_TIMESTAMP= ]]; then
                 cached_timestamp="${line#CONFIG_TIMESTAMP=}"
@@ -250,7 +287,7 @@ function load_cached_config() {
                 cached_patterns+=("${line#EXCLUDE_PATTERN=}")
             fi
         done < "$CONFIG_CACHE_FILE"
-
+        
         # 检查配置文件是否存在且时间戳一致
         if [ -f "$CONFIG_FILE" ]; then
             local current_timestamp=$(stat -c %Y "$CONFIG_FILE" 2>/dev/null)
@@ -263,8 +300,8 @@ function load_cached_config() {
                 LOCAL_DIRS=("${cached_dirs[@]}")
                 EXCLUDE_PATTERNS=("${cached_patterns[@]}")
                 CONFIG_TIMESTAMP="$cached_timestamp"
-
-                echo -e "${GRAY}Loaded cached configuration (${#LOCAL_DIRS[@]} dirs, ${#EXCLUDE_PATTERNS[@]} excludes)${NC}"
+                
+                # 缓存配置加载完成（静默）
                 return 0
             fi
         fi
@@ -277,111 +314,87 @@ function update_remote_repository() {
     local remote_target_dir="$1"
     local dir_name="$2"
     local files_to_keep="$3"  # 要保留的文件列表
-
-    # 在远程执行git操作：智能回滚和拉取最新版本
-    ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
-        cd $remote_target_dir 2>/dev/null || exit 1
-
-        # 检查是否为git仓库
-        if [ -d .git ]; then
-            # 获取所有修改的文件
-            all_modified=\$(git diff --name-only 2>/dev/null || echo '')
-            all_staged=\$(git diff --cached --name-only 2>/dev/null || echo '')
-            all_untracked=\$(git ls-files --others --exclude-standard 2>/dev/null || echo '')
-
-            # 要保留的文件列表
-            keep_files='$files_to_keep'
-
-            # 排除模式列表
-            exclude_patterns='$(printf '%s\n' "${EXCLUDE_PATTERNS[@]}" | tr '\n' '|' | sed 's/|$//')'
-
-            # 智能回滚：只回滚不需要保留的修改文件
-            if [ -n \"\$all_modified\" ]; then
-                for file in \$all_modified; do
-                    should_keep=false
-
-                    # 检查是否在保留列表中
-                    if echo \"\$keep_files\" | grep -q \"^\$file\$\"; then
-                        should_keep=true
-                    fi
-
-                    # 检查是否匹配排除模式
-                    if [ -n \"\$exclude_patterns\" ] && echo \"\$file\" | grep -E \"\$exclude_patterns\" >/dev/null 2>&1; then
-                        should_keep=true
-                    fi
-
-                    # 如果不需要保留，则回滚该文件
-                    if [ \"\$should_keep\" = false ]; then
-                        git checkout -- \"\$file\" 2>/dev/null || true
-                    fi
-                done
-            fi
-
-            # 智能清理：只清理不需要保留的未跟踪文件
-            if [ -n \"\$all_untracked\" ]; then
-                for file in \$all_untracked; do
-                    should_keep=false
-
-                    # 检查是否在保留列表中
-                    if echo \"\$keep_files\" | grep -q \"^\$file\$\"; then
-                        should_keep=true
-                    fi
-
-                    # 检查是否匹配排除模式
-                    if [ -n \"\$exclude_patterns\" ] && echo \"\$file\" | grep -E \"\$exclude_patterns\" >/dev/null 2>&1; then
-                        should_keep=true
-                    fi
-
-                    # 如果不需要保留，则删除该文件
-                    if [ \"\$should_keep\" = false ]; then
-                        rm -f \"\$file\" 2>/dev/null || true
-                    fi
-                done
-            fi
-
-            # 尝试拉取最新版本
-            if git remote | grep -q origin; then
-                git pull origin \$(git branch --show-current 2>/dev/null || echo main) 2>/dev/null || {
-                    echo 'Pull failed, repository may need manual intervention'
-                }
-            fi
+    local local_hash="$4"     # 本地当前哈希值
+    local local_branch="$5"   # 本地当前分支
+    
+    # 静默执行版本同步
+    
+    # 确保远程脚本已上传
+    if ! ensure_remote_script; then
+        echo -e "${RED}[$dir_name] Failed to ensure remote script${NC}"
+        return 1
+    fi
+    
+    # 准备排除模式参数
+    local exclude_patterns=$(printf '%s\n' "${EXCLUDE_PATTERNS[@]}" | tr '\n' '|' | sed 's/|$//')
+    
+    # 使用远程脚本执行同步
+    local sync_result=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" \
+        "$REMOTE_SCRIPT_PATH sync_version \"$remote_target_dir\" \"$files_to_keep\" \"$local_hash\" \"$local_branch\" \"$exclude_patterns\"" 2>/dev/null)
+    
+    # 解析同步结果
+    local remote_info=""
+    local sync_status=""
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^REMOTE_STATUS: ]]; then
+            remote_info="${line#REMOTE_STATUS:}"
+        elif [[ "$line" =~ ^(HASH_MATCH|REMOTE_NEWER|PULLING_TO_LOCAL_HASH|BRANCH_DIVERGED_RESETTING|BRANCH_MISMATCH_SWITCHING|SYNC_COMPLETED|NOT_GIT_REPO|NO_REMOTE_ORIGIN|RESET_FAILED|HASH_NOT_FOUND)$ ]]; then
+            sync_status="$line"
+        elif [[ "$line" =~ ^ERROR: ]]; then
+            echo -e "${RED}[$dir_name] ${line#ERROR:}${NC}"
+            return 1
         fi
-    " 2>/dev/null
+    done <<< "$sync_result"
+    
+    # 显示同步结果（只显示关键状态）
+    case "$sync_status" in
+        "HASH_MATCH")
+            return 0  # 静默跳过，版本已同步
+            ;;
+        "REMOTE_NEWER")
+            echo -e "${YELLOW}[$dir_name] Remote version is newer${NC}"
+            ;;
+        "PULLING_TO_LOCAL_HASH"|"BRANCH_DIVERGED_RESETTING"|"BRANCH_MISMATCH_SWITCHING")
+            echo -e "${CYAN}[$dir_name] Updated to local version${NC}"
+            ;;
+        "NOT_GIT_REPO"|"RESET_FAILED"|"HASH_NOT_FOUND")
+            echo -e "${RED}[$dir_name] Sync failed: $sync_status${NC}"
+            ;;
+        "NO_REMOTE_ORIGIN")
+            echo -e "${YELLOW}[$dir_name] No remote origin${NC}"
+            ;;
+    esac
 }
 
 function perform_initial_sync() {
     local local_dir="$1"
     local remote_target_dir="$2"
     local dir_name="$3"
-
-    echo -e "${YELLOW}[$dir_name] Initial sync: compressing project...${NC}"
-
+    
+    echo -e "${YELLOW}[$dir_name] Initial sync...${NC}"
+    
     # 创建临时压缩文件
     local temp_archive=$(mktemp --suffix=.tar.gz)
     local exclude_args_tar=$(get_tar_exclude_args)
-    local dir_size=$(du -sh "$local_dir" 2>/dev/null | cut -f1)
-
+    
     # 压缩当前目录
     eval "tar -czf '$temp_archive' $exclude_args_tar --exclude='.git' -C '$local_dir' ." 2>/dev/null
-
+    
     if [ $? -eq 0 ]; then
-        local archive_size=$(du -h "$temp_archive" | cut -f1)
-        echo -e "${YELLOW}[$dir_name] Transferring ($dir_size → $archive_size)...${NC}"
-
+        
         # 传输并设置远程
         ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "mkdir -p $remote_target_dir" 2>/dev/null
         scp -P "$REMOTE_PORT" "$temp_archive" "$REMOTE_HOST:$remote_target_dir/project.tar.gz" 2>/dev/null
-
+        
         if [ $? -eq 0 ]; then
             ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
                 cd $remote_target_dir
                 tar -xzf project.tar.gz && rm -f project.tar.gz
-                git init >/dev/null 2>&1
-                git config core.autocrlf input >/dev/null 2>&1
-                git config core.safecrlf warn >/dev/null 2>&1
-                git add . >/dev/null 2>&1 && git commit -m 'Initial commit from sync service' >/dev/null 2>&1
-            " 2>/dev/null
-
+            " 2>/dev/null && \
+            ssh "$REMOTE_HOST" -p "$REMOTE_PORT" \
+                "$REMOTE_SCRIPT_PATH init_repo \"$remote_target_dir\"" 2>/dev/null
+            
             rm -f "$temp_archive"
             echo -e "${GREEN}[$dir_name] Initial sync completed${NC}"
             return 0
@@ -398,50 +411,42 @@ function perform_initial_sync() {
 }
 
 function sync_files() {
-    echo -e "${GREEN}Starting incremental git sync...${NC}"
-
     local exclude_args=$(get_exclude_args)
-
+    
     for local_dir in "${LOCAL_DIRS[@]}"; do
         local dir_name=$(basename "$local_dir")
         local remote_target_dir="$REMOTE_DIR/$dir_name"
-
-        echo -e "${CYAN}Processing directory: $local_dir -> $remote_target_dir${NC}"
-
+        
         # 检查本地目录是否存在
         if [ ! -d "$local_dir" ]; then
-            echo -e "${RED}Local directory not found: $local_dir${NC}"
+            echo -e "${RED}[$dir_name] Directory not found${NC}"
             continue
         fi
-
+        
         # 检查本地是否为git仓库
         if [ ! -d "$local_dir/.git" ]; then
             echo -e "${YELLOW}[$dir_name] Not a git repository, skipping...${NC}"
             continue
         fi
-
+        
         cd "$local_dir"
-
+        
         # 首先检查远程目录是否存在项目
-        local remote_exists=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
-            if [ -d $remote_target_dir ] && [ -d $remote_target_dir/.git ]; then
-                echo 'exists'
-            else
-                echo 'not_exists'
-            fi
-        " 2>/dev/null)
-
+        # 确保远程脚本已上传
+        if ! ensure_remote_script; then
+            echo -e "${RED}[$dir_name] Failed to ensure remote script${NC}"
+            continue
+        fi
+        
+        local remote_exists=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" \
+            "$REMOTE_SCRIPT_PATH check_repo \"$remote_target_dir\"" 2>/dev/null)
+        
         if [ "$remote_exists" = "not_exists" ]; then
             # 执行初始完整同步
-            if perform_initial_sync "$local_dir" "$remote_target_dir" "$dir_name"; then
-                echo -e "${DARK_GRAY}----------------------------------------${NC}"
-                continue
-            else
-                echo -e "${DARK_GRAY}----------------------------------------${NC}"
-                continue
-            fi
+            perform_initial_sync "$local_dir" "$remote_target_dir" "$dir_name"
+            continue
         fi
-
+        
         # 远程项目存在，检查是否有需要同步的变更
         # 获取当前分支名
         local current_branch=$(git branch --show-current 2>/dev/null)
@@ -449,94 +454,86 @@ function sync_files() {
             echo -e "${RED}[$dir_name] Unable to determine current branch${NC}"
             continue
         fi
-
+        
         # 检查远程分支是否存在
         local remote_branch="origin/$current_branch"
         if ! git rev-parse --verify "$remote_branch" >/dev/null 2>&1; then
             # 如果远程分支不存在，检查是否有未提交的更改
             if git diff --quiet && git diff --cached --quiet; then
                 # 即使没有本地更改，也要确保远程保持最新
+                local local_hash=$(git rev-parse HEAD 2>/dev/null)
                 echo -e "${YELLOW}[$dir_name] No local changes, updating remote...${NC}"
-                update_remote_repository "$remote_target_dir" "$dir_name" ""
-                echo -e "${GREEN}[$dir_name] Remote updated${NC}"
-                echo -e "${DARK_GRAY}----------------------------------------${NC}"
+                update_remote_repository "$remote_target_dir" "$dir_name" "" "$local_hash" "$current_branch"
                 continue
             fi
         else
             # 检查是否有未推送到远程主分支的提交
             local unpushed_commits=$(git rev-list --count "$remote_branch..HEAD" 2>/dev/null || echo "0")
             local uncommitted_changes=false
-
+            
             # 同时检查是否有未提交的更改
             if ! git diff --quiet || ! git diff --cached --quiet; then
                 uncommitted_changes=true
             fi
-
+            
             if [ "$unpushed_commits" -eq 0 ] && [ "$uncommitted_changes" = false ]; then
                 # 即使没有本地更改，也要确保远程保持最新
+                local local_hash=$(git rev-parse HEAD 2>/dev/null)
                 echo -e "${YELLOW}[$dir_name] No local changes, updating remote...${NC}"
-                update_remote_repository "$remote_target_dir" "$dir_name" ""
-                echo -e "${GREEN}[$dir_name] Remote updated${NC}"
-                echo -e "${DARK_GRAY}----------------------------------------${NC}"
+                update_remote_repository "$remote_target_dir" "$dir_name" "" "$local_hash" "$current_branch"
                 continue
             fi
         fi
-
+        
         # 获取需要同步的文件列表
         local modified_files=$(git diff --name-only)
         local staged_files=$(git diff --cached --name-only)
         local untracked_files=$(git ls-files --others --exclude-standard)
-
+        
         # 获取未推送提交中的文件
         local unpushed_files=""
         local remote_branch="origin/$current_branch"
         if git rev-parse --verify "$remote_branch" >/dev/null 2>&1; then
             unpushed_files=$(git diff --name-only "$remote_branch..HEAD" 2>/dev/null || echo "")
         fi
-
+        
         # 合并所有需要同步的文件
         local all_files="$modified_files"$'\n'"$staged_files"$'\n'"$untracked_files"$'\n'"$unpushed_files"
         local unique_files=$(echo "$all_files" | grep -v '^$' | sort -u)
-
+        
         if [ -z "$unique_files" ]; then
             echo -e "${GREEN}[$dir_name] No changes to sync${NC}"
-            echo -e "${DARK_GRAY}----------------------------------------${NC}"
             continue
         fi
-
+        
         # 统计文件数量
         local file_count=$(echo "$unique_files" | wc -l)
         local modified_count=$(echo "$modified_files" | grep -v '^$' | wc -l)
         local staged_count=$(echo "$staged_files" | grep -v '^$' | wc -l)
         local untracked_count=$(echo "$untracked_files" | grep -v '^$' | wc -l)
         local unpushed_count=$(echo "$unpushed_files" | grep -v '^$' | wc -l)
-
+        
         local sync_info=""
         [ $modified_count -gt 0 ] && sync_info+="M:$modified_count "
         [ $staged_count -gt 0 ] && sync_info+="S:$staged_count "
         [ $untracked_count -gt 0 ] && sync_info+="U:$untracked_count "
         [ $unpushed_count -gt 0 ] && sync_info+="P:$unpushed_count "
-
+        
         echo -e "${YELLOW}[$dir_name] Syncing $file_count files ($sync_info)${NC}"
-
-        # 在同步前，智能回滚远程不需要的文件
-        echo -e "${GRAY}[$dir_name] Smart rollback on remote...${NC}"
-        update_remote_repository "$remote_target_dir" "$dir_name" "$unique_files"
-
+        
+        # 在同步前，智能版本同步和回滚远程不需要的文件
+        local local_hash=$(git rev-parse HEAD 2>/dev/null)
+        update_remote_repository "$remote_target_dir" "$dir_name" "$unique_files" "$local_hash" "$current_branch"
+        
         # 使用rsync同步特定文件
         if [ -n "$unique_files" ]; then
-            # 调试：显示要同步的文件列表
-            echo -e "${GRAY}Files to sync: $(echo "$unique_files" | tr '\n' ' ')${NC}"
-
-            # 构建rsync命令，使用--include和--exclude模式来只同步指定文件
             local remote_target="${REMOTE_HOST}:${remote_target_dir}/"
             local include_args=""
-
+            
             # 为每个文件创建include参数
             while IFS= read -r file; do
                 if [ -n "$file" ]; then
                     include_args+="--include=$file "
-                    # 如果文件在子目录中，也需要包含父目录
                     local dir_path=$(dirname "$file")
                     while [ "$dir_path" != "." ] && [ "$dir_path" != "/" ]; do
                         include_args+="--include=$dir_path/ "
@@ -544,49 +541,26 @@ function sync_files() {
                     done
                 fi
             done <<< "$unique_files"
-
-            # 排除所有其他文件
+            
             include_args+="--exclude=* "
-
             local rsync_cmd="rsync -avz $include_args $exclude_args -e \"ssh -p $REMOTE_PORT\" \"$local_dir/\" \"$remote_target\""
-
-            # 显示rsync命令（调试用）
-            echo -e "${GRAY}Executing: rsync with $(echo "$unique_files" | wc -l) files${NC}"
-
-            # 执行rsync并显示传输信息
-            eval "$rsync_cmd" 2>&1 | grep -E "(sending|sent|total|->)" || true
-            local exit_code=${PIPESTATUS[0]}
-
+            
+            # 静默执行rsync
+            eval "$rsync_cmd" >/dev/null 2>&1
+            local exit_code=$?
+            
             if [ $exit_code -eq 0 ]; then
-                echo -e "${GREEN}[$dir_name] Sync completed${NC}"
+                echo -e "${GREEN}[$dir_name] Files synced${NC}"
             else
-                echo -e "${RED}[$dir_name] Sync failed (exit code: $exit_code)${NC}"
+                echo -e "${RED}[$dir_name] Sync failed${NC}"
             fi
-        else
-            echo -e "${YELLOW}[$dir_name] No valid files to sync${NC}"
         fi
-
-        echo -e "${DARK_GRAY}----------------------------------------${NC}"
     done
 }
 
 function show_config() {
     echo -e "${CYAN}=== Git Sync Service ===${NC}"
-    echo -e "${WHITE}Remote: $REMOTE_HOST:$REMOTE_DIR${NC}"
-    echo -e "${WHITE}Interval: ${REFRESH_INTERVAL}s | Repositories: ${#LOCAL_DIRS[@]} | Excludes: ${#EXCLUDE_PATTERNS[@]}${NC}"
-
-    local git_repos=0
-    for dir in "${LOCAL_DIRS[@]}"; do
-        if [ -d "$dir/.git" ]; then
-            ((git_repos++))
-        fi
-    done
-
-    if [ $git_repos -eq ${#LOCAL_DIRS[@]} ]; then
-        echo -e "${GREEN}All directories are Git repositories${NC}"
-    else
-        echo -e "${YELLOW}Warning: $((${#LOCAL_DIRS[@]} - git_repos)) directories are not Git repositories${NC}"
-    fi
+    echo -e "${WHITE}Remote: $REMOTE_HOST:$REMOTE_DIR | Interval: ${REFRESH_INTERVAL}s | Repos: ${#LOCAL_DIRS[@]}${NC}"
     echo ""
 }
 
@@ -614,9 +588,8 @@ echo ""
 while true; do
     # 每次循环前检查配置文件是否有变化
     load_config
-
+    
     sync_files
-    echo -e "${GRAY}Next check in $REFRESH_INTERVAL seconds...${NC}"
-    echo ""
+    # 静默等待下次检查
     sleep "$REFRESH_INTERVAL"
-done
+done 
