@@ -14,6 +14,7 @@ EXCLUDE_PATTERNS=(
     '.gitignore'
     '.idea'
     '.vscode'
+    '.log'
     '.vs'
     '__pycache__'
     'build'
@@ -51,16 +52,68 @@ function get_tar_exclude_args() {
 function update_remote_repository() {
     local remote_target_dir="$1"
     local dir_name="$2"
+    local files_to_keep="$3"  # 要保留的文件列表
 
-    # 在远程执行git操作：回滚本地修改并拉取最新版本
+    # 在远程执行git操作：智能回滚和拉取最新版本
     ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
         cd $remote_target_dir 2>/dev/null || exit 1
 
         # 检查是否为git仓库
         if [ -d .git ]; then
-            # 回滚所有本地修改
-            git checkout . 2>/dev/null || true
-            git clean -fd 2>/dev/null || true
+            # 获取所有修改的文件
+            all_modified=\$(git diff --name-only 2>/dev/null || echo '')
+            all_staged=\$(git diff --cached --name-only 2>/dev/null || echo '')
+            all_untracked=\$(git ls-files --others --exclude-standard 2>/dev/null || echo '')
+
+            # 要保留的文件列表
+            keep_files='$files_to_keep'
+
+            # 排除模式列表
+            exclude_patterns='$(printf '%s\n' "${EXCLUDE_PATTERNS[@]}" | tr '\n' '|' | sed 's/|$//')'
+
+            # 智能回滚：只回滚不需要保留的修改文件
+            if [ -n \"\$all_modified\" ]; then
+                for file in \$all_modified; do
+                    should_keep=false
+
+                    # 检查是否在保留列表中
+                    if echo \"\$keep_files\" | grep -q \"^\$file\$\"; then
+                        should_keep=true
+                    fi
+
+                    # 检查是否匹配排除模式
+                    if [ -n \"\$exclude_patterns\" ] && echo \"\$file\" | grep -E \"\$exclude_patterns\" >/dev/null 2>&1; then
+                        should_keep=true
+                    fi
+
+                    # 如果不需要保留，则回滚该文件
+                    if [ \"\$should_keep\" = false ]; then
+                        git checkout -- \"\$file\" 2>/dev/null || true
+                    fi
+                done
+            fi
+
+            # 智能清理：只清理不需要保留的未跟踪文件
+            if [ -n \"\$all_untracked\" ]; then
+                for file in \$all_untracked; do
+                    should_keep=false
+
+                    # 检查是否在保留列表中
+                    if echo \"\$keep_files\" | grep -q \"^\$file\$\"; then
+                        should_keep=true
+                    fi
+
+                    # 检查是否匹配排除模式
+                    if [ -n \"\$exclude_patterns\" ] && echo \"\$file\" | grep -E \"\$exclude_patterns\" >/dev/null 2>&1; then
+                        should_keep=true
+                    fi
+
+                    # 如果不需要保留，则删除该文件
+                    if [ \"\$should_keep\" = false ]; then
+                        rm -f \"\$file\" 2>/dev/null || true
+                    fi
+                done
+            fi
 
             # 尝试拉取最新版本
             if git remote | grep -q origin; then
@@ -180,7 +233,7 @@ function sync_files() {
             if git diff --quiet && git diff --cached --quiet; then
                 # 即使没有本地更改，也要确保远程保持最新
                 echo -e "${YELLOW}[$dir_name] No local changes, updating remote...${NC}"
-                update_remote_repository "$remote_target_dir" "$dir_name"
+                update_remote_repository "$remote_target_dir" "$dir_name" ""
                 echo -e "${GREEN}[$dir_name] Remote updated${NC}"
                 echo -e "${DARK_GRAY}----------------------------------------${NC}"
                 continue
@@ -198,34 +251,12 @@ function sync_files() {
             if [ "$unpushed_commits" -eq 0 ] && [ "$uncommitted_changes" = false ]; then
                 # 即使没有本地更改，也要确保远程保持最新
                 echo -e "${YELLOW}[$dir_name] No local changes, updating remote...${NC}"
-                update_remote_repository "$remote_target_dir" "$dir_name"
+                update_remote_repository "$remote_target_dir" "$dir_name" ""
                 echo -e "${GREEN}[$dir_name] Remote updated${NC}"
                 echo -e "${DARK_GRAY}----------------------------------------${NC}"
                 continue
             fi
         fi
-
-        # 在远程执行git操作：回滚本地修改并拉取最新版本
-        ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
-            cd $remote_target_dir 2>/dev/null || exit 1
-
-            # 检查是否为git仓库
-            if [ -d .git ]; then
-                # 回滚所有本地修改
-                git checkout . 2>/dev/null || true
-                git clean -fd 2>/dev/null || true
-
-                # 尝试拉取最新版本
-                if git remote | grep -q origin; then
-                    echo 'Pulling latest changes from origin...'
-                    git pull origin \$(git branch --show-current 2>/dev/null || echo main) 2>/dev/null || {
-                        echo 'Pull failed, repository may need manual intervention'
-                    }
-                else
-                    echo 'No remote origin configured'
-                fi
-            fi
-        "
 
         # 获取需要同步的文件列表
         local modified_files=$(git diff --name-only)
@@ -263,6 +294,10 @@ function sync_files() {
         [ $unpushed_count -gt 0 ] && sync_info+="P:$unpushed_count "
 
         echo -e "${YELLOW}[$dir_name] Syncing $file_count files ($sync_info)${NC}"
+
+        # 在同步前，智能回滚远程不需要的文件
+        echo -e "${GRAY}[$dir_name] Smart rollback on remote...${NC}"
+        update_remote_repository "$remote_target_dir" "$dir_name" "$unique_files"
 
         # 使用rsync同步特定文件
         if [ -n "$unique_files" ]; then
