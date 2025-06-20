@@ -5,7 +5,7 @@ REMOTE_HOST="127.0.0.1"
 REMOTE_PORT="22"
 LOCAL_DIRS=("/mnt/d/PycharmProjects/searxng" "/mnt/d/PycharmProjects/fast-crawler")
 REMOTE_DIR="/root/work"
-REFRESH_INTERVAL=60
+REFRESH_INTERVAL=20
 
 
 # 排除目录配置 - 可以根据需要修改
@@ -48,29 +48,53 @@ function get_tar_exclude_args() {
 }
 
 
+function update_remote_repository() {
+    local remote_target_dir="$1"
+    local dir_name="$2"
+
+    # 在远程执行git操作：回滚本地修改并拉取最新版本
+    ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
+        cd $remote_target_dir 2>/dev/null || exit 1
+
+        # 检查是否为git仓库
+        if [ -d .git ]; then
+            # 回滚所有本地修改
+            git checkout . 2>/dev/null || true
+            git clean -fd 2>/dev/null || true
+
+            # 尝试拉取最新版本
+            if git remote | grep -q origin; then
+                git pull origin \$(git branch --show-current 2>/dev/null || echo main) 2>/dev/null || {
+                    echo 'Pull failed, repository may need manual intervention'
+                }
+            fi
+        fi
+    " 2>/dev/null
+}
+
 function perform_initial_sync() {
     local local_dir="$1"
     local remote_target_dir="$2"
     local dir_name="$3"
-    
+
     echo -e "${YELLOW}[$dir_name] Initial sync: compressing project...${NC}"
-    
+
     # 创建临时压缩文件
     local temp_archive=$(mktemp --suffix=.tar.gz)
     local exclude_args_tar=$(get_tar_exclude_args)
     local dir_size=$(du -sh "$local_dir" 2>/dev/null | cut -f1)
-    
+
     # 压缩当前目录
     eval "tar -czf '$temp_archive' $exclude_args_tar --exclude='.git' -C '$local_dir' ." 2>/dev/null
-    
+
     if [ $? -eq 0 ]; then
         local archive_size=$(du -h "$temp_archive" | cut -f1)
         echo -e "${YELLOW}[$dir_name] Transferring ($dir_size → $archive_size)...${NC}"
-        
+
         # 传输并设置远程
         ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "mkdir -p $remote_target_dir" 2>/dev/null
         scp -P "$REMOTE_PORT" "$temp_archive" "$REMOTE_HOST:$remote_target_dir/project.tar.gz" 2>/dev/null
-        
+
         if [ $? -eq 0 ]; then
             ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
                 cd $remote_target_dir
@@ -80,7 +104,7 @@ function perform_initial_sync() {
                 git config core.safecrlf warn >/dev/null 2>&1
                 git add . >/dev/null 2>&1 && git commit -m 'Initial commit from sync service' >/dev/null 2>&1
             " 2>/dev/null
-            
+
             rm -f "$temp_archive"
             echo -e "${GREEN}[$dir_name] Initial sync completed${NC}"
             return 0
@@ -98,29 +122,29 @@ function perform_initial_sync() {
 
 function sync_files() {
     echo -e "${GREEN}Starting incremental git sync...${NC}"
-    
+
     local exclude_args=$(get_exclude_args)
-    
+
     for local_dir in "${LOCAL_DIRS[@]}"; do
         local dir_name=$(basename "$local_dir")
         local remote_target_dir="$REMOTE_DIR/$dir_name"
-        
+
         echo -e "${CYAN}Processing directory: $local_dir -> $remote_target_dir${NC}"
-        
+
         # 检查本地目录是否存在
         if [ ! -d "$local_dir" ]; then
             echo -e "${RED}Local directory not found: $local_dir${NC}"
             continue
         fi
-        
+
         # 检查本地是否为git仓库
         if [ ! -d "$local_dir/.git" ]; then
             echo -e "${YELLOW}[$dir_name] Not a git repository, skipping...${NC}"
             continue
         fi
-        
+
         cd "$local_dir"
-        
+
         # 首先检查远程目录是否存在项目
         local remote_exists=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
             if [ -d $remote_target_dir ] && [ -d $remote_target_dir/.git ]; then
@@ -129,7 +153,7 @@ function sync_files() {
                 echo 'not_exists'
             fi
         " 2>/dev/null)
-        
+
         if [ "$remote_exists" = "not_exists" ]; then
             # 执行初始完整同步
             if perform_initial_sync "$local_dir" "$remote_target_dir" "$dir_name"; then
@@ -140,7 +164,7 @@ function sync_files() {
                 continue
             fi
         fi
-        
+
         # 远程项目存在，检查是否有需要同步的变更
         # 获取当前分支名
         local current_branch=$(git branch --show-current 2>/dev/null)
@@ -148,13 +172,16 @@ function sync_files() {
             echo -e "${RED}[$dir_name] Unable to determine current branch${NC}"
             continue
         fi
-        
+
         # 检查远程分支是否存在
         local remote_branch="origin/$current_branch"
         if ! git rev-parse --verify "$remote_branch" >/dev/null 2>&1; then
             # 如果远程分支不存在，检查是否有未提交的更改
             if git diff --quiet && git diff --cached --quiet; then
-                echo -e "${GREEN}[$dir_name] No changes to sync${NC}"
+                # 即使没有本地更改，也要确保远程保持最新
+                echo -e "${YELLOW}[$dir_name] No local changes, updating remote...${NC}"
+                update_remote_repository "$remote_target_dir" "$dir_name"
+                echo -e "${GREEN}[$dir_name] Remote updated${NC}"
                 echo -e "${DARK_GRAY}----------------------------------------${NC}"
                 continue
             fi
@@ -162,14 +189,17 @@ function sync_files() {
             # 检查是否有未推送到远程主分支的提交
             local unpushed_commits=$(git rev-list --count "$remote_branch..HEAD" 2>/dev/null || echo "0")
             local uncommitted_changes=false
-            
+
             # 同时检查是否有未提交的更改
             if ! git diff --quiet || ! git diff --cached --quiet; then
                 uncommitted_changes=true
             fi
-            
+
             if [ "$unpushed_commits" -eq 0 ] && [ "$uncommitted_changes" = false ]; then
-                echo -e "${GREEN}[$dir_name] No changes to sync${NC}"
+                # 即使没有本地更改，也要确保远程保持最新
+                echo -e "${YELLOW}[$dir_name] No local changes, updating remote...${NC}"
+                update_remote_repository "$remote_target_dir" "$dir_name"
+                echo -e "${GREEN}[$dir_name] Remote updated${NC}"
                 echo -e "${DARK_GRAY}----------------------------------------${NC}"
                 continue
             fi
