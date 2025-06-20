@@ -51,8 +51,7 @@
 REMOTE_HOST="127.0.0.1"                    # 远程服务器IP
 REMOTE_PORT="22"                           # SSH端口
 LOCAL_DIRS=(                               # 本地Git仓库目录列表 (WSL路径)
-    "/mnt/d/PycharmProjects/searxng" 
-    "/mnt/d/PycharmProjects/fast-crawler"
+    "/mnt/d/PycharmProjects/test" 
 )
 REMOTE_DIR="/root/work"                    # 远程目标目录
 REFRESH_INTERVAL=60                        # 同步间隔(秒)

@@ -14,7 +14,7 @@ DEFAULT_REMOTE_HOST="34.68.158.244"
 DEFAULT_REMOTE_PORT="22"
 DEFAULT_REMOTE_DIR="/root/work"
 DEFAULT_REFRESH_INTERVAL=60
-DEFAULT_LOCAL_DIRS=("/mnt/d/PycharmProjects/searxng" "/mnt/d/PycharmProjects/fast-crawler")
+DEFAULT_LOCAL_DIRS=
 DEFAULT_EXCLUDE_PATTERNS=(
     '.git'
     '.gitignore'
