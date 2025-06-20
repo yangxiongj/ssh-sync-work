@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# 防止重复加载配置函数
+if [ -n "$SYNC_CONFIG_LOADED" ]; then
+    return 0 2>/dev/null || true
+fi
+SYNC_CONFIG_LOADED=true
+
 # 配置文件路径
 CONFIG_FILE="/mnt/d/sync.yaml"
 
@@ -121,8 +127,11 @@ function load_config() {
             in_directories_section=false
             in_remote_section=false
             continue
-        elif [[ "$line" =~ ^refresh_interval:[[:space:]]*([0-9]+) ]]; then
-            REFRESH_INTERVAL="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^refresh_interval:[[:space:]]*(.+)$ ]]; then
+            local interval_value="${BASH_REMATCH[1]}"
+            # 去除引号并提取数字
+            interval_value=$(echo "$interval_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
+            REFRESH_INTERVAL="$interval_value"
             echo -e "${GRAY}  Set refresh_interval: $REFRESH_INTERVAL${NC}"
             in_directories_section=false
             in_remote_section=false
@@ -138,12 +147,22 @@ function load_config() {
         
         # 处理remote部分的配置
         if [ "$in_remote_section" = true ]; then
-            if [[ "$line" =~ ^host:[[:space:]]*[\"\']*([^\"\']+)[\"\']*$ ]]; then
-                REMOTE_HOST="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^port:[[:space:]]*([0-9]+) ]]; then
-                REMOTE_PORT="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^dir:[[:space:]]*[\"\']*([^\"\']+)[\"\']*$ ]]; then
-                REMOTE_DIR="${BASH_REMATCH[1]}"
+            if [[ "$line" =~ ^host:[[:space:]]*(.+)$ ]]; then
+                # 提取值并去除引号
+                local host_value="${BASH_REMATCH[1]}"
+                # 去除双引号和单引号
+                host_value=$(echo "$host_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
+                REMOTE_HOST="$host_value"
+            elif [[ "$line" =~ ^port:[[:space:]]*(.+)$ ]]; then
+                local port_value="${BASH_REMATCH[1]}"
+                # 去除引号并提取数字
+                port_value=$(echo "$port_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
+                REMOTE_PORT="$port_value"
+            elif [[ "$line" =~ ^dir:[[:space:]]*(.+)$ ]]; then
+                local dir_value="${BASH_REMATCH[1]}"
+                # 去除引号
+                dir_value=$(echo "$dir_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
+                REMOTE_DIR="$dir_value"
             fi
         fi
         
@@ -257,8 +276,6 @@ function ensure_remote_script() {
     fi
 }
 
-
-
 function load_cached_config() {
     # 如果缓存文件存在，尝试加载缓存
     if [ -f "$CONFIG_CACHE_FILE" ]; then
@@ -308,7 +325,6 @@ function load_cached_config() {
     fi
     return 1
 }
-
 
 function update_remote_repository() {
     local remote_target_dir="$1"
@@ -570,26 +586,29 @@ function cleanup() {
     exit 0
 }
 
-# 设置信号处理
-trap cleanup SIGINT SIGTERM
+# 主执行逻辑 - 只有直接运行脚本时才执行
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    # 设置信号处理
+    trap cleanup SIGINT SIGTERM
 
-# 初始加载配置
-if ! load_cached_config; then
-    load_config
-fi
+    # 初始加载配置
+    if ! load_cached_config; then
+        load_config
+    fi
 
-# 显示配置信息
-show_config
+    # 显示配置信息
+    show_config
 
-# 主循环
-echo -e "${GREEN}Git sync started. Press Ctrl+C to stop.${NC}"
-echo ""
+    # 主循环
+    echo -e "${GREEN}Git sync started. Press Ctrl+C to stop.${NC}"
+    echo ""
 
-while true; do
-    # 每次循环前检查配置文件是否有变化
-    load_config
-    
-    sync_files
-    # 静默等待下次检查
-    sleep "$REFRESH_INTERVAL"
-done 
+    while true; do
+        # 每次循环前检查配置文件是否有变化
+        load_config
+        
+        sync_files
+        # 静默等待下次检查
+        sleep "$REFRESH_INTERVAL"
+    done
+fi 

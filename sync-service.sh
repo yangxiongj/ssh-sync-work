@@ -9,8 +9,8 @@ PID_FILE="$SCRIPT_DIR/service.pid"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 REMOTE_HELPER_SCRIPT="$SCRIPT_DIR/remote-sync-helper.sh"
 
-# 配置文件路径
-CONFIG_FILE="/mnt/d/sync.yaml"
+# 导入配置处理函数
+source "$MAIN_SCRIPT"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -26,44 +26,6 @@ function write_service_log() {
     local log_entry="[$timestamp] $message"
     echo -e "$log_entry"
     echo "$log_entry" >> "$LOG_FILE"
-}
-
-# 读取配置文件函数
-function read_config() {
-    local remote_host=""
-    local remote_port="22"
-    
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${YELLOW}警告: 配置文件不存在 $CONFIG_FILE${NC}"
-        echo -e "${YELLOW}将使用默认配置进行远程脚本上传测试${NC}"
-        remote_host="34.68.158.244"
-        remote_port="22"
-    else
-        # 解析YAML配置
-        local in_remote_section=false
-        while IFS= read -r line; do
-            line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            [[ -z "$line" || "$line" =~ ^# ]] && continue
-            
-            if [[ "$line" =~ ^remote: ]]; then
-                in_remote_section=true
-                continue
-            elif [[ "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*: ]]; then
-                in_remote_section=false
-                continue
-            fi
-            
-            if [ "$in_remote_section" = true ]; then
-                if [[ "$line" =~ ^host:[[:space:]]*[\"\']*([^\"\']+)[\"\']*$ ]]; then
-                    remote_host="${BASH_REMATCH[1]}"
-                elif [[ "$line" =~ ^port:[[:space:]]*([0-9]+) ]]; then
-                    remote_port="${BASH_REMATCH[1]}"
-                fi
-            fi
-        done < "$CONFIG_FILE"
-    fi
-    
-    echo "$remote_host:$remote_port"
 }
 
 # 上传远程脚本函数
@@ -116,15 +78,21 @@ function install_sync_service() {
         exit 1
     fi
     
-    # 步骤1: 上传远程助手脚本
+    # 步骤1: 加载配置
     echo ""
-    echo -e "${CYAN}步骤1: 上传远程助手脚本${NC}"
-    config_info=$(read_config)
-    remote_host="${config_info%%:*}"
-    remote_port="${config_info##*:}"
+    echo -e "${CYAN}步骤1: 加载配置文件${NC}"
     
-    if [ -n "$remote_host" ]; then
-        if upload_remote_script "$remote_host" "$remote_port"; then
+    # 使用导入的配置函数
+    if ! load_cached_config; then
+        load_config
+    fi
+    
+    # 步骤2: 上传远程助手脚本
+    echo ""
+    echo -e "${CYAN}步骤2: 上传远程助手脚本${NC}"
+    
+    if [ -n "$REMOTE_HOST" ]; then
+        if upload_remote_script "$REMOTE_HOST" "$REMOTE_PORT"; then
             echo -e "${GREEN}✓ 远程脚本上传完成${NC}"
         else
             echo -e "${YELLOW}警告: 远程脚本上传失败，服务仍可正常安装${NC}"
@@ -134,9 +102,9 @@ function install_sync_service() {
         echo -e "${YELLOW}跳过远程脚本上传（无有效配置）${NC}"
     fi
     
-    # 步骤2: 创建systemd服务
+    # 步骤3: 创建systemd服务
     echo ""
-    echo -e "${CYAN}步骤2: 创建systemd服务${NC}"
+    echo -e "${CYAN}步骤3: 创建systemd服务${NC}"
     
     # 创建systemd服务文件
     cat > "$SERVICE_FILE" << EOF
