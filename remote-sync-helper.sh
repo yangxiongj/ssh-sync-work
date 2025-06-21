@@ -29,6 +29,11 @@ function smart_version_sync() {
         exit 0
     fi
     
+    # 先尝试更新远程信息（静默执行）
+    if git remote | grep -q origin; then
+        git fetch origin 2>/dev/null || true
+    fi
+    
     # 获取远程当前状态
     local remote_hash=$(git rev-parse HEAD 2>/dev/null || echo '')
     local remote_branch=$(git branch --show-current 2>/dev/null || echo '')
@@ -55,9 +60,10 @@ function smart_version_sync() {
             # 远程哈希是本地的祖先，需要更新到本地哈希
             if git remote | grep -q origin; then
                 echo 'PULLING_TO_LOCAL_HASH'
+                # 先确保有最新的远程信息
+                git fetch origin "$local_branch" 2>/dev/null || true
                 git pull origin "$local_branch" 2>/dev/null || {
                     # Pull失败，强制重置到本地哈希
-                    git fetch origin "$local_branch" 2>/dev/null || true
                     force_reset_to_hash "$local_hash"
                 }
             else
@@ -71,7 +77,10 @@ function smart_version_sync() {
     else
         # 分支不一致，切换到本地分支并重置
         echo 'BRANCH_MISMATCH_SWITCHING'
-        git fetch origin 2>/dev/null || true
+        # 确保有最新的远程分支信息
+        if git remote | grep -q origin; then
+            git fetch origin 2>/dev/null || true
+        fi
         git checkout "$local_branch" 2>/dev/null || git checkout -b "$local_branch" 2>/dev/null || true
         force_reset_to_hash "$local_hash"
     fi
