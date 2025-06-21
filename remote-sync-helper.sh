@@ -193,35 +193,20 @@ function check_git_repo() {
     fi
 }
 
-# 功能：初始化git仓库
-function init_git_repo() {
-    local target_dir="$1"
-    
-    cd "$target_dir" || exit 1
-    
-    git init >/dev/null 2>&1
-    git config core.autocrlf input >/dev/null 2>&1
-    git config core.safecrlf warn >/dev/null 2>&1
-    git add . >/dev/null 2>&1 && git commit -m 'Initial commit from sync service' >/dev/null 2>&1
-    
-    echo 'INIT_COMPLETED'
-}
+
 
 # 主函数：根据参数执行不同功能
 case "$1" in
     "check_repo")
         check_git_repo "$2"
         ;;
-    "init_repo")
-        init_git_repo "$2"
-        ;;
+
     "sync_version")
         smart_version_sync "$2" "$3" "$4" "$5" "$6"
         ;;
     *)
-        echo "Usage: $0 {check_repo|init_repo|sync_version} [args...]"
+        echo "Usage: $0 {check_repo|sync_version} [args...]"
         echo "  check_repo <target_dir>"
-        echo "  init_repo <target_dir>"
         echo "  sync_version <target_dir> <files_to_keep> <local_hash> <local_branch> <exclude_patterns>"
         exit 1
         ;;

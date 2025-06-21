@@ -394,8 +394,8 @@ function perform_initial_sync() {
     local temp_archive=$(mktemp --suffix=.tar.gz)
     local exclude_args_tar=$(get_tar_exclude_args)
     
-    # 压缩当前目录
-    eval "tar -czf '$temp_archive' $exclude_args_tar --exclude='.git' -C '$local_dir' ." 2>/dev/null
+    # 压缩当前目录（包含.git目录以保持Git历史）
+    eval "tar -czf '$temp_archive' $exclude_args_tar -C '$local_dir' ." 2>/dev/null
     
     if [ $? -eq 0 ]; then
         
@@ -407,9 +407,7 @@ function perform_initial_sync() {
             ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
                 cd $remote_target_dir
                 tar -xzf project.tar.gz && rm -f project.tar.gz
-            " 2>/dev/null && \
-            ssh "$REMOTE_HOST" -p "$REMOTE_PORT" \
-                "$REMOTE_SCRIPT_PATH init_repo \"$remote_target_dir\"" 2>/dev/null
+            " 2>/dev/null
             
             rm -f "$temp_archive"
             echo -e "${GREEN}[$dir_name] Initial sync completed${NC}"
