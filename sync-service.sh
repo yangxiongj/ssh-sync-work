@@ -29,118 +29,8 @@ function write_service_log() {
     echo "$log_entry" >> "$LOG_FILE"
 }
 
-# 上传远程脚本函数
-function upload_remote_script() {
-    local remote_host="$1"
-    local remote_port="$2"
-    local remote_script_path="/tmp/remote-sync-helper.sh"
-    
-    echo -e "${CYAN}上传远程助手脚本到 $remote_host:$remote_port...${NC}"
-    
-    # 检查本地远程脚本是否存在
-    if [ ! -f "$REMOTE_HELPER_SCRIPT" ]; then
-        echo -e "${RED}错误: 找不到远程助手脚本 $REMOTE_HELPER_SCRIPT${NC}"
-        return 1
-    fi
-    
-    # 测试SSH连接
-    if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "$remote_host" -p "$remote_port" "echo 'SSH连接测试成功'" 2>/dev/null; then
-        echo -e "${RED}错误: 无法连接到远程服务器 $remote_host:$remote_port${NC}"
-        echo -e "${YELLOW}请检查:${NC}"
-        echo -e "${WHITE}  1. 服务器地址和端口是否正确${NC}"
-        echo -e "${WHITE}  2. SSH密钥是否已配置${NC}"
-        echo -e "${WHITE}  3. 网络连接是否正常${NC}"
-        return 1
-    fi
-    
-    # 上传脚本
-    if scp -P "$remote_port" "$REMOTE_HELPER_SCRIPT" "$remote_host:$remote_script_path" 2>/dev/null; then
-        # 设置执行权限
-        if ssh "$remote_host" -p "$remote_port" "chmod +x $remote_script_path" 2>/dev/null; then
-            echo -e "${GREEN}✓ 远程助手脚本上传成功${NC}"
-            return 0
-        else
-            echo -e "${RED}错误: 无法设置远程脚本执行权限${NC}"
-            return 1
-        fi
-    else
-        echo -e "${RED}错误: 远程脚本上传失败${NC}"
-        return 1
-    fi
-}
 
-function install_sync_service() {
-    write_service_log "开始安装文件同步服务..."
-    
-    # 检查是否有sudo权限
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}错误: 需要sudo权限来安装systemd服务${NC}"
-        echo "请使用: sudo $0 install"
-        exit 1
-    fi
-    
-    # 步骤1: 加载配置
-    echo ""
-    echo -e "${CYAN}步骤1: 加载配置文件${NC}"
-    
-    # 使用导入的配置函数
-    if ! load_cached_config; then
-        load_config
-    fi
-    
-    # 步骤2: 上传远程助手脚本
-    echo ""
-    echo -e "${CYAN}步骤2: 上传远程助手脚本${NC}"
-    
-    if [ -n "$REMOTE_HOST" ]; then
-        if upload_remote_script "$REMOTE_HOST" "$REMOTE_PORT"; then
-            echo -e "${GREEN}✓ 远程脚本上传完成${NC}"
-        else
-            echo -e "${YELLOW}警告: 远程脚本上传失败，服务仍可正常安装${NC}"
-            echo -e "${YELLOW}首次运行时会自动上传远程脚本${NC}"
-        fi
-    else
-        echo -e "${YELLOW}跳过远程脚本上传（无有效配置）${NC}"
-    fi
-    
-    # 步骤3: 创建systemd服务
-    echo ""
-    echo -e "${CYAN}步骤3: 创建systemd服务${NC}"
-    
-    # 创建systemd服务文件
-    cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=File Sync Service
-After=network.target
 
-[Service]
-Type=simple
-User=$SUDO_USER
-Group=$SUDO_USER
-WorkingDirectory=$SCRIPT_DIR
-ExecStart=$MAIN_SCRIPT
-Restart=always
-RestartSec=10
-StandardOutput=append:$LOG_FILE
-StandardError=append:$LOG_FILE
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    # 设置脚本执行权限
-    chmod +x "$MAIN_SCRIPT"
-    
-    # 重新加载systemd配置
-    systemctl daemon-reload
-    
-    # 启用服务开机自启
-    systemctl enable "$SERVICE_NAME"
-    
-    write_service_log "服务安装成功！已创建开机自启动服务。"
-    write_service_log "服务名称: $SERVICE_NAME"
-    write_service_log "服务文件: $SERVICE_FILE"
-}
 
 function uninstall_sync_service() {
     write_service_log "开始卸载文件同步服务..."
@@ -237,7 +127,7 @@ function start_sync_service() {
     # 检查服务是否已安装
     if [ ! -f "$SERVICE_FILE" ]; then
         echo -e "${RED}错误: 服务未安装，请先运行安装命令${NC}"
-        echo "使用: sudo $0 install"
+        echo "使用: sudo ./install.sh"
         exit 1
     fi
     
@@ -334,11 +224,36 @@ function show_usage() {
     echo "  logs        查看服务日志"
     echo "  logs-f      实时查看服务日志"
     echo ""
+    echo -e "${GRAY}注意: install命令会自动调用 ./install.sh${NC}"
+    echo ""
     echo "示例:"
-    echo "  sudo $0 install     # 安装服务"
+    echo "  sudo $0 install    # 安装服务"
     echo "  $0 start           # 启动服务"
     echo "  $0 status          # 查看状态"
     echo "  $0 logs-f          # 实时查看日志"
+    echo "  sudo $0 uninstall  # 卸载服务"
+}
+
+# 安装服务函数（调用install.sh）
+function install_sync_service() {
+    echo -e "${CYAN}调用统一安装脚本...${NC}"
+    
+    # 检查install.sh是否存在
+    local install_script="$SCRIPT_DIR/install.sh"
+    if [ ! -f "$install_script" ]; then
+        echo -e "${RED}错误: 找不到安装脚本 $install_script${NC}"
+        exit 1
+    fi
+    
+    # 检查是否有sudo权限
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${YELLOW}需要sudo权限来安装系统服务${NC}"
+        echo -e "${YELLOW}正在调用: sudo $install_script${NC}"
+        exec sudo "$install_script"
+    else
+        # 已经是root权限，直接执行
+        exec "$install_script"
+    fi
 }
 
 # 主逻辑
