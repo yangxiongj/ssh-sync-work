@@ -10,6 +10,27 @@ YELLOW='\033[1;33m'
 GRAY='\033[0;37m'
 NC='\033[0m'
 
+# 安全函数：验证Git哈希格式
+function validate_git_hash() {
+    local hash="$1"
+    if [[ ! "$hash" =~ ^[a-f0-9]{7,40}$ ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# 安全函数：创建数据备份
+function create_safety_backup() {
+    local backup_dir=".git/sync-backup-$(date +%s)"
+    
+    # 备份当前状态
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        mkdir -p "$backup_dir"
+        git stash push -u -m "sync-backup-$(date)" 2>/dev/null || true
+        echo "BACKUP_CREATED:$backup_dir"
+    fi
+}
+
 # 功能：智能版本同步
 function smart_version_sync() {
     local target_dir="$1"
@@ -37,6 +58,13 @@ function smart_version_sync() {
     # 获取远程当前状态
     local remote_hash=$(git rev-parse HEAD 2>/dev/null || echo '')
     local remote_branch=$(git branch --show-current 2>/dev/null || echo '')
+    
+    # 如果是detached HEAD状态，尝试获取更多信息
+    if [ -z "$remote_branch" ] && [ -n "$remote_hash" ]; then
+        if ! git symbolic-ref HEAD >/dev/null 2>&1; then
+            remote_branch="(detached:${remote_hash:0:8})"
+        fi
+    fi
     
     # 输出当前状态用于调试
     echo "REMOTE_STATUS:$remote_branch:$remote_hash"
@@ -88,14 +116,35 @@ function smart_version_sync() {
     echo 'SYNC_COMPLETED'
 }
 
-# 功能：强制重置到指定哈希，不保留任何本地修改
+# 功能：强制重置到指定哈希，不保留任何本地修改（安全版本）
 function force_reset_to_hash() {
     local target_hash="$1"
+    
+    # 验证哈希格式
+    if ! validate_git_hash "$target_hash"; then
+        echo 'INVALID_HASH_FORMAT'
+        return 1
+    fi
     
     # 检查目标哈希是否存在
     if ! git cat-file -e "$target_hash" 2>/dev/null; then
         echo 'HASH_NOT_FOUND'
         return 1
+    fi
+    
+    # 创建安全备份
+    create_safety_backup
+    
+    # 检查是否有重要的未提交更改
+    local has_important_changes=false
+    if git status --porcelain 2>/dev/null | grep -E '\.(sql|db|config|env)$' >/dev/null; then
+        has_important_changes=true
+    fi
+    
+    # 如果有重要更改，创建紧急提交
+    if [ "$has_important_changes" = true ]; then
+        git add . 2>/dev/null || true
+        git commit -m "Emergency backup before sync reset - $(date)" 2>/dev/null || true
     fi
     
     # 强制清理所有本地状态（静默执行）
@@ -105,22 +154,34 @@ function force_reset_to_hash() {
     git am --abort 2>/dev/null || true
     git reset HEAD . 2>/dev/null || true
     git checkout --force . 2>/dev/null || true
-    git clean -fdx 2>/dev/null || true
+    
+    # 限制性清理：只清理非重要文件
+    git clean -fd 2>/dev/null || true  # 移除-x选项，保留.gitignore文件
     
     # 强制重置到目标哈希
     if git reset --hard "$target_hash" 2>/dev/null; then
+        echo 'RESET_SUCCESS'
         return 0
     else
-        # 激进重置方法
-        rm -f .git/index 2>/dev/null || true
+        # 激进重置方法（作为最后手段）
+        if [ -f .git/index ]; then
+            cp .git/index .git/index.backup 2>/dev/null || true
+            rm -f .git/index 2>/dev/null || true
+        fi
+        
         if git checkout --force "$target_hash" 2>/dev/null; then
             local current_branch=$(git branch --show-current 2>/dev/null || echo '')
             if [ -z "$current_branch" ]; then
                 local branch_name=$(git symbolic-ref --short HEAD 2>/dev/null || echo 'main')
                 git checkout -B "$branch_name" "$target_hash" 2>/dev/null || true
             fi
+            echo 'RESET_SUCCESS_FALLBACK'
             return 0
         else
+            # 恢复index备份
+            if [ -f .git/index.backup ]; then
+                mv .git/index.backup .git/index 2>/dev/null || true
+            fi
             echo 'RESET_FAILED'
             return 1
         fi
@@ -192,8 +253,6 @@ function check_git_repo() {
         echo 'not_exists'
     fi
 }
-
-
 
 # 主函数：根据参数执行不同功能
 case "$1" in

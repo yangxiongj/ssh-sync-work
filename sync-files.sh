@@ -14,7 +14,7 @@ DEFAULT_REMOTE_HOST="34.68.158.244"
 DEFAULT_REMOTE_PORT="22"
 DEFAULT_REMOTE_DIR="/root/work"
 DEFAULT_REFRESH_INTERVAL=60
-DEFAULT_LOCAL_DIRS=
+DEFAULT_LOCAL_DIRS=()
 DEFAULT_EXCLUDE_PATTERNS=(
     '.git'
     '.gitignore'
@@ -55,6 +55,12 @@ WHITE='\033[1;37m'
 GRAY='\033[0;37m'
 DARK_GRAY='\033[1;30m'
 NC='\033[0m' # No Color
+
+# 全局变量：循环计数器和错误统计
+LOOP_COUNTER=0
+ERROR_COUNTER=0
+MAX_ERRORS=10
+MAX_LOOPS=86400  # 24小时最大循环次数（按秒计算）
 
 function get_exclude_args() {
     local exclude_args=""
@@ -383,43 +389,78 @@ function update_remote_repository() {
     esac
 }
 
+# 安全函数：验证路径是否安全
+function validate_path() {
+    local path="$1"
+    # 检查路径是否包含危险字符
+    if [[ "$path" =~ \.\./|^\.|^/|[\;\|\&\$\`] ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# 安全函数：转义shell特殊字符
+function escape_shell_arg() {
+    local arg="$1"
+    # 使用printf %q进行安全转义
+    printf '%q' "$arg"
+}
+
+# 功能：执行初始完整同步（安全版本）
 function perform_initial_sync() {
     local local_dir="$1"
     local remote_target_dir="$2"
     local dir_name="$3"
     
-    echo -e "${YELLOW}[$dir_name] Initial sync...${NC}"
+    # 验证路径安全性
+    if ! validate_path "$remote_target_dir"; then
+        echo -e "${RED}[$dir_name] Invalid remote path detected${NC}"
+        return 1
+    fi
     
-    # 创建临时压缩文件
     local temp_archive=$(mktemp --suffix=.tar.gz)
     local exclude_args_tar=$(get_tar_exclude_args)
     
-    # 压缩当前目录（包含.git目录以保持Git历史）
-    eval "tar -czf '$temp_archive' $exclude_args_tar -C '$local_dir' ." 2>/dev/null
+    # 安全的tar命令构建
+    local tar_cmd="tar -czf $(escape_shell_arg "$temp_archive") $exclude_args_tar -C $(escape_shell_arg "$local_dir") ."
     
-    if [ $? -eq 0 ]; then
-        
-        # 传输并设置远程
-        ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "mkdir -p $remote_target_dir" 2>/dev/null
-        scp -P "$REMOTE_PORT" "$temp_archive" "$REMOTE_HOST:$remote_target_dir/project.tar.gz" 2>/dev/null
-        
-        if [ $? -eq 0 ]; then
-            ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
-                cd $remote_target_dir
-                tar -xzf project.tar.gz && rm -f project.tar.gz
-            " 2>/dev/null
-            
-            rm -f "$temp_archive"
-            echo -e "${GREEN}[$dir_name] Initial sync completed${NC}"
-            return 0
-        else
-            echo -e "${RED}[$dir_name] Transfer failed${NC}"
-            rm -f "$temp_archive"
-            return 1
-        fi
-    else
-        echo -e "${RED}[$dir_name] Compression failed${NC}"
+    # 使用安全的命令执行方式，而不是eval
+    if ! tar -czf "$temp_archive" $exclude_args_tar -C "$local_dir" . 2>/dev/null; then
+        echo -e "${RED}[$dir_name] Failed to create archive${NC}"
         rm -f "$temp_archive"
+        return 1
+    fi
+    
+    # 创建远程目录（安全版本）
+    local escaped_remote_dir=$(escape_shell_arg "$remote_target_dir")
+    if ! ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "mkdir -p $escaped_remote_dir" 2>/dev/null; then
+        echo -e "${RED}[$dir_name] Failed to create remote directory${NC}"
+        rm -f "$temp_archive"
+        return 1
+    fi
+    
+    # 上传文件
+    if ! scp -P "$REMOTE_PORT" "$temp_archive" "$REMOTE_HOST:$remote_target_dir/project.tar.gz" 2>/dev/null; then
+        echo -e "${RED}[$dir_name] Failed to upload archive${NC}"
+        rm -f "$temp_archive"
+        return 1
+    fi
+    
+    # 远程解压（安全版本）
+    local remote_extract_result=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
+        cd $(escape_shell_arg "$remote_target_dir") && 
+        tar -xzf project.tar.gz && 
+        rm -f project.tar.gz && 
+        echo 'SUCCESS'
+    " 2>/dev/null)
+    
+    rm -f "$temp_archive"
+    
+    if [ "$remote_extract_result" = "SUCCESS" ]; then
+        echo -e "${GREEN}[$dir_name] Initial sync completed${NC}"
+        return 0
+    else
+        echo -e "${RED}[$dir_name] Failed to extract on remote${NC}"
         return 1
     fi
 }
@@ -443,7 +484,10 @@ function sync_files() {
             continue
         fi
         
-        cd "$local_dir"
+        if ! cd "$local_dir" 2>/dev/null; then
+            echo -e "${RED}[$dir_name] Cannot access directory${NC}"
+            continue
+        fi
         
         # 首先检查远程目录是否存在项目
         # 确保远程脚本已上传
@@ -462,11 +506,39 @@ function sync_files() {
         fi
         
         # 远程项目存在，检查是否有需要同步的变更
-        # 获取当前分支名
+        # 获取当前分支名或HEAD状态
         local current_branch=$(git branch --show-current 2>/dev/null)
+        local is_detached_head=false
+        
         if [ -z "$current_branch" ]; then
-            echo -e "${RED}[$dir_name] Unable to determine current branch${NC}"
-            continue
+            # 检查是否处于detached HEAD状态
+            if git symbolic-ref HEAD >/dev/null 2>&1; then
+                echo -e "${RED}[$dir_name] Unable to determine current branch${NC}"
+                continue
+            else
+                # 处于detached HEAD状态
+                is_detached_head=true
+                local current_commit=$(git rev-parse HEAD 2>/dev/null)
+                echo -e "${YELLOW}[$dir_name] Detached HEAD at ${current_commit:0:8}${NC}"
+                
+                # 尝试找到包含当前commit的分支
+                local containing_branches=$(git branch --contains HEAD 2>/dev/null | grep -v '(HEAD detached' | head -1 | sed 's/^[* ] *//')
+                if [ -n "$containing_branches" ]; then
+                    current_branch="$containing_branches"
+                    echo -e "${CYAN}[$dir_name] Using branch: $current_branch (contains current commit)${NC}"
+                else
+                    # 如果找不到包含的分支，使用master/main作为默认分支
+                    if git show-ref --verify --quiet refs/heads/master; then
+                        current_branch="master"
+                    elif git show-ref --verify --quiet refs/heads/main; then
+                        current_branch="main"
+                    else
+                        echo -e "${RED}[$dir_name] Cannot determine branch for detached HEAD${NC}"
+                        continue
+                    fi
+                    echo -e "${CYAN}[$dir_name] Using default branch: $current_branch${NC}"
+                fi
+            fi
         fi
         
         # 检查远程分支是否存在
@@ -539,31 +611,48 @@ function sync_files() {
         local local_hash=$(git rev-parse HEAD 2>/dev/null)
         update_remote_repository "$remote_target_dir" "$dir_name" "$unique_files" "$local_hash" "$current_branch"
         
-        # 使用rsync同步特定文件
+        # 使用rsync同步特定文件（安全版本）
         if [ -n "$unique_files" ]; then
             local remote_target="${REMOTE_HOST}:${remote_target_dir}/"
             local include_args=""
             
-            # 为每个文件创建include参数
+            # 安全的文件路径处理
             while IFS= read -r file; do
                 if [ -n "$file" ]; then
-                    include_args+="--include=$file "
+                    # 验证文件路径安全性
+                    if ! validate_path "$file"; then
+                        echo -e "${YELLOW}[$dir_name] Skipping unsafe path: $file${NC}"
+                        continue
+                    fi
+                    
+                    include_args+="--include=$(escape_shell_arg "$file") "
                     local dir_path=$(dirname "$file")
-                    while [ "$dir_path" != "." ] && [ "$dir_path" != "/" ]; do
-                        include_args+="--include=$dir_path/ "
+                    # 限制目录遍历深度，防止无限循环
+                    local depth=0
+                    while [ "$dir_path" != "." ] && [ "$dir_path" != "/" ] && [ $depth -lt 20 ]; do
+                        if validate_path "$dir_path"; then
+                            include_args+="--include=$(escape_shell_arg "$dir_path")/ "
+                        fi
                         dir_path=$(dirname "$dir_path")
+                        ((depth++))
                     done
                 fi
             done <<< "$unique_files"
             
             include_args+="--exclude=* "
-            local rsync_cmd="rsync -avz $include_args $exclude_args -e \"ssh -p $REMOTE_PORT\" \"$local_dir/\" \"$remote_target\""
+            
+            # 使用数组而不是eval来安全执行rsync
+            local rsync_args=(
+                "-avz"
+                $include_args
+                $exclude_args
+                "-e" "ssh -p $REMOTE_PORT"
+                "$local_dir/"
+                "$remote_target"
+            )
             
             # 静默执行rsync
-            eval "$rsync_cmd" >/dev/null 2>&1
-            local exit_code=$?
-            
-            if [ $exit_code -eq 0 ]; then
+            if rsync "${rsync_args[@]}" >/dev/null 2>&1; then
                 echo -e "${GREEN}[$dir_name] Files synced${NC}"
             else
                 echo -e "${RED}[$dir_name] Sync failed${NC}"
@@ -581,7 +670,56 @@ function show_config() {
 # 信号处理函数
 function cleanup() {
     echo -e "\n${YELLOW}Received interrupt signal, stopping sync...${NC}"
+    # 清理临时文件
+    rm -f /tmp/sync_*.tar.gz 2>/dev/null || true
+    echo -e "${CYAN}Loop statistics: $LOOP_COUNTER iterations, $ERROR_COUNTER errors${NC}"
     exit 0
+}
+
+# 安全函数：检查系统资源
+function check_system_resources() {
+    # 检查内存使用率
+    local mem_usage=$(free | awk 'NR==2{printf "%.0f", $3*100/$2}' 2>/dev/null || echo "0")
+    if [ "$mem_usage" -gt 90 ]; then
+        echo -e "${RED}Warning: High memory usage (${mem_usage}%)${NC}"
+        return 1
+    fi
+    
+    # 检查磁盘空间
+    local disk_usage=$(df / | awk 'NR==2{print $5}' | sed 's/%//' 2>/dev/null || echo "0")
+    if [ "$disk_usage" -gt 95 ]; then
+        echo -e "${RED}Warning: Low disk space (${disk_usage}% used)${NC}"
+        return 1
+    fi
+    
+    return 0
+}
+
+# 安全函数：循环保护检查
+function check_loop_safety() {
+    ((LOOP_COUNTER++))
+    
+    # 检查循环次数
+    if [ $LOOP_COUNTER -gt $MAX_LOOPS ]; then
+        echo -e "${RED}Error: Maximum loop count reached. Exiting for safety.${NC}"
+        return 1
+    fi
+    
+    # 检查错误次数
+    if [ $ERROR_COUNTER -gt $MAX_ERRORS ]; then
+        echo -e "${RED}Error: Too many errors encountered. Exiting for safety.${NC}"
+        return 1
+    fi
+    
+    # 每100次循环检查一次系统资源
+    if [ $((LOOP_COUNTER % 100)) -eq 0 ]; then
+        if ! check_system_resources; then
+            ((ERROR_COUNTER++))
+            return 1
+        fi
+    fi
+    
+    return 0
 }
 
 # 主执行逻辑 - 只有直接运行脚本时才执行
@@ -597,15 +735,32 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     # 显示配置信息
     show_config
 
-    # 主循环
+    # 主循环（安全版本）
     echo -e "${GREEN}Git sync started. Press Ctrl+C to stop.${NC}"
     echo ""
 
     while true; do
-        # 每次循环前检查配置文件是否有变化
-        load_config
+        # 循环安全检查
+        if ! check_loop_safety; then
+            echo -e "${RED}Safety check failed. Stopping sync service.${NC}"
+            break
+        fi
         
-        sync_files
+        # 每次循环前检查配置文件是否有变化
+        if ! load_config; then
+            echo -e "${YELLOW}Failed to load config, using cached version${NC}"
+            ((ERROR_COUNTER++))
+        fi
+        
+        # 执行同步，捕获错误
+        if ! sync_files; then
+            echo -e "${YELLOW}Sync failed, continuing...${NC}"
+            ((ERROR_COUNTER++))
+        else
+            # 成功执行，重置错误计数器
+            ERROR_COUNTER=0
+        fi
+        
         # 静默等待下次检查
         sleep "$REFRESH_INTERVAL"
     done
