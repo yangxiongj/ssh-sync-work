@@ -392,8 +392,16 @@ function update_remote_repository() {
 # 安全函数：验证路径是否安全
 function validate_path() {
     local path="$1"
-    # 检查路径是否包含危险字符
-    if [[ "$path" =~ \.\./|^\.|^/|[\;\|\&\$\`] ]]; then
+    # 检查路径是否包含危险字符，但允许正常的绝对路径
+    if [[ "$path" =~ \.\./|^\.|[\;\|\&\$\`] ]]; then
+        return 1
+    fi
+    # 检查是否包含连续的斜杠（可能的路径注入）
+    if [[ "$path" =~ // ]]; then
+        return 1
+    fi
+    # 检查是否包含危险的系统路径（但允许常用的工作目录）
+    if [[ "$path" =~ ^/etc/|^/boot/|^/sys/|^/proc/|^/dev/ ]]; then
         return 1
     fi
     return 0
