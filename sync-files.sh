@@ -476,49 +476,24 @@ function perform_compressed_initial_sync() {
     
     echo -e "${CYAN}[$dir_name] Creating compressed archive (${compression_mode} mode)...${NC}"
     
-    # 根据压缩模式选择算法和级别
+    # 统一使用LZ4压缩（已确保安装）
+    temp_archive=$(mktemp --suffix=.tar.lz4)
     case "$compression_mode" in
         "fast")
-            # 快速模式：优先使用lz4，压缩级别最低
-            if command -v lz4 >/dev/null 2>&1; then
-                temp_archive=$(mktemp --suffix=.tar.lz4)
-                compression_level="-1"  # 最快压缩
-                echo -e "${CYAN}[$dir_name] Using LZ4 fast compression...${NC}"
-            else
-                temp_archive=$(mktemp --suffix=.tar.gz)
-                compression_level="-1"  # gzip最快级别
-                echo -e "${CYAN}[$dir_name] Using gzip fast compression...${NC}"
-            fi
+            compression_level="-1"  # 最快压缩
+            echo -e "${CYAN}[$dir_name] Using LZ4 fast compression...${NC}"
             ;;
         "standard")
-            # 标准模式：平衡压缩率和速度
-            if command -v lz4 >/dev/null 2>&1; then
-                temp_archive=$(mktemp --suffix=.tar.lz4)
-                compression_level="-3"  # 平衡压缩
-                echo -e "${CYAN}[$dir_name] Using LZ4 standard compression...${NC}"
-            else
-                temp_archive=$(mktemp --suffix=.tar.gz)
-                compression_level="-3"  # gzip平衡级别
-                echo -e "${CYAN}[$dir_name] Using gzip standard compression...${NC}"
-            fi
+            compression_level="-3"  # 平衡压缩
+            echo -e "${CYAN}[$dir_name] Using LZ4 standard compression...${NC}"
             ;;
     esac
     
-    # 执行压缩
-    if [[ "$temp_archive" == *.lz4 ]]; then
-        # 使用lz4压缩
-        if ! tar -cf - $exclude_args_tar -C "$local_dir" . | lz4 $compression_level > "$temp_archive" 2>/dev/null; then
-            echo -e "${RED}[$dir_name] Failed to create lz4 archive${NC}"
-            rm -f "$temp_archive"
-            return 1
-        fi
-    else
-        # 使用gzip压缩
-        if ! tar -cf - $exclude_args_tar -C "$local_dir" . | gzip $compression_level > "$temp_archive" 2>/dev/null; then
-            echo -e "${RED}[$dir_name] Failed to create gzip archive${NC}"
-            rm -f "$temp_archive"
-            return 1
-        fi
+    # 执行LZ4压缩
+    if ! tar -cf - $exclude_args_tar -C "$local_dir" . | lz4 $compression_level > "$temp_archive" 2>/dev/null; then
+        echo -e "${RED}[$dir_name] Failed to create lz4 archive${NC}"
+        rm -f "$temp_archive"
+        return 1
     fi
     
     # 显示压缩后的文件大小
@@ -536,29 +511,15 @@ function perform_compressed_initial_sync() {
     # 使用优化的传输参数上传
     echo -e "${CYAN}[$dir_name] Uploading archive (${archive_size})...${NC}"
     
-    # 根据文件类型选择最优传输参数
-    local transfer_args=()
-    if [[ "$temp_archive" == *.lz4 ]]; then
-        # LZ4文件：禁用SSH压缩，使用快速传输
-        transfer_args=(
-            "-P" "$REMOTE_PORT"
-            "-o" "Compression=no"        # 禁用SSH压缩
-            "-o" "ConnectTimeout=10"
-            "-o" "ServerAliveInterval=60"
-            "$temp_archive"
-            "$REMOTE_HOST:$remote_target_dir/project.tar.lz4"
-        )
-    else
-        # GZIP文件：同样禁用SSH压缩
-        transfer_args=(
-            "-P" "$REMOTE_PORT"
-            "-o" "Compression=no"        # 禁用SSH压缩
-            "-o" "ConnectTimeout=10"
-            "-o" "ServerAliveInterval=60"
-            "$temp_archive"
-            "$REMOTE_HOST:$remote_target_dir/project.tar.gz"
-        )
-    fi
+    # LZ4文件传输参数（禁用SSH压缩）
+    local transfer_args=(
+        "-P" "$REMOTE_PORT"
+        "-o" "Compression=no"        # 禁用SSH压缩
+        "-o" "ConnectTimeout=10"
+        "-o" "ServerAliveInterval=60"
+        "$temp_archive"
+        "$REMOTE_HOST:$remote_target_dir/project.tar.lz4"
+    )
     
     # 显示传输进度（如果有pv工具）
     if command -v pv >/dev/null 2>&1; then
@@ -582,26 +543,12 @@ function perform_compressed_initial_sync() {
     local extract_cmd=""
     local archive_name=""
     
-    if [[ "$temp_archive" == *.lz4 ]]; then
-        archive_name="project.tar.lz4"
-        # 检查远程是否有lz4工具
-        extract_cmd="
-            if command -v lz4 >/dev/null 2>&1; then
-                lz4 -dc $archive_name | tar -xf -
-            else
-                echo 'ERROR: lz4 not found on remote server'
-                exit 1
-            fi
-        "
-    else
-        archive_name="project.tar.gz"
-        extract_cmd="tar -xzf $archive_name"
-    fi
+    # 原子性操作：解压lz4文件并立即删除
+    extract_cmd="lz4 -dc project.tar.lz4 | tar -xf - && rm -f project.tar.lz4"
     
     local remote_extract_result=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
         cd $(escape_shell_arg "$remote_target_dir") && 
         $extract_cmd && 
-        rm -f $archive_name && 
         echo 'SUCCESS'
     " 2>/dev/null)
     
