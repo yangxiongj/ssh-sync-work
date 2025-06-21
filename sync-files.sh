@@ -414,7 +414,7 @@ function escape_shell_arg() {
     printf '%q' "$arg"
 }
 
-# 功能：执行初始完整同步（高性能版本）
+# 功能：执行初始完整同步（优化的压缩传输）
 function perform_initial_sync() {
     local local_dir="$1"
     local remote_target_dir="$2"
@@ -426,87 +426,82 @@ function perform_initial_sync() {
         return 1
     fi
     
-    echo -e "${YELLOW}[$dir_name] Starting optimized initial sync...${NC}"
+    echo -e "${YELLOW}[$dir_name] Starting initial sync with optimized compression...${NC}"
     
-    # 检查文件大小，选择最优传输方式
+    # 统一使用压缩传输（更高效）
     local dir_size=$(du -sm "$local_dir" 2>/dev/null | cut -f1)
+    echo -e "${CYAN}[$dir_name] Directory size: ${dir_size}MB${NC}"
     
-    if [ "$dir_size" -gt 50 ]; then
-        # 大文件使用rsync直接传输（更快）
-        echo -e "${CYAN}[$dir_name] Large directory (${dir_size}MB), using direct rsync...${NC}"
-        perform_rsync_initial_sync "$local_dir" "$remote_target_dir" "$dir_name"
+    # 检查文件数量，选择最优压缩策略
+    local file_count=$(find "$local_dir" -type f | wc -l)
+    echo -e "${CYAN}[$dir_name] File count: ${file_count}${NC}"
+    
+    if [ "$file_count" -gt 10000 ] || [ "$dir_size" -gt 500 ]; then
+        # 大量文件或超大目录：使用快速压缩
+        echo -e "${CYAN}[$dir_name] Using fast compression for large dataset...${NC}"
+        perform_compressed_initial_sync "$local_dir" "$remote_target_dir" "$dir_name" "fast"
     else
-        # 小文件使用优化的压缩传输
-        echo -e "${CYAN}[$dir_name] Small directory (${dir_size}MB), using optimized compression...${NC}"
-        perform_compressed_initial_sync "$local_dir" "$remote_target_dir" "$dir_name"
+        # 普通大小：使用标准压缩
+        echo -e "${CYAN}[$dir_name] Using standard compression...${NC}"
+        perform_compressed_initial_sync "$local_dir" "$remote_target_dir" "$dir_name" "standard"
     fi
 }
 
-# 功能：使用rsync进行初始同步（适合大文件）
-function perform_rsync_initial_sync() {
-    local local_dir="$1"
-    local remote_target_dir="$2"
-    local dir_name="$3"
-    
-    # 创建远程目录
-    local escaped_remote_dir=$(escape_shell_arg "$remote_target_dir")
-    if ! ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "mkdir -p $escaped_remote_dir" 2>/dev/null; then
-        echo -e "${RED}[$dir_name] Failed to create remote directory${NC}"
-        return 1
-    fi
-    
-    local exclude_args=$(get_exclude_args)
-    local remote_target="${REMOTE_HOST}:${remote_target_dir}/"
-    
-    # 高性能rsync参数
-    local rsync_args=(
-        "-avz"                    # 归档模式，详细输出，压缩传输
-        "--compress-level=1"      # 低压缩级别（快速）
-        "--whole-file"           # 传输整个文件（适合网络较好的情况）
-        "--partial"              # 支持断点续传
-        "--progress"             # 显示进度
-        "--stats"                # 显示统计信息
-        $exclude_args
-        "-e" "ssh -p $REMOTE_PORT -o Compression=no -o ConnectTimeout=10"
-        "$local_dir/"
-        "$remote_target"
-    )
-    
-    echo -e "${CYAN}[$dir_name] Transferring with optimized rsync...${NC}"
-    if rsync "${rsync_args[@]}" 2>/dev/null; then
-        echo -e "${GREEN}[$dir_name] Direct rsync completed${NC}"
-        return 0
-    else
-        echo -e "${RED}[$dir_name] Direct rsync failed${NC}"
-        return 1
-    fi
-}
 
-# 功能：使用优化压缩进行初始同步（适合小文件）
+
+# 功能：使用优化压缩进行初始同步
 function perform_compressed_initial_sync() {
     local local_dir="$1"
     local remote_target_dir="$2"
     local dir_name="$3"
+    local compression_mode="${4:-standard}"  # fast|standard
     
-    # 使用更快的压缩算法和更高的并行度
-    local temp_archive=$(mktemp --suffix=.tar.lz4)
     local exclude_args_tar=$(get_tar_exclude_args)
+    local temp_archive=""
+    local compression_level=""
     
-    echo -e "${CYAN}[$dir_name] Creating optimized archive...${NC}"
+    echo -e "${CYAN}[$dir_name] Creating compressed archive (${compression_mode} mode)...${NC}"
     
-    # 使用lz4压缩（如果可用），否则使用gzip低压缩级别
-    if command -v lz4 >/dev/null 2>&1; then
-        # 使用lz4压缩（速度最快）
-        if ! tar -cf - $exclude_args_tar -C "$local_dir" . | lz4 -1 > "$temp_archive" 2>/dev/null; then
+    # 根据压缩模式选择算法和级别
+    case "$compression_mode" in
+        "fast")
+            # 快速模式：优先使用lz4，压缩级别最低
+            if command -v lz4 >/dev/null 2>&1; then
+                temp_archive=$(mktemp --suffix=.tar.lz4)
+                compression_level="-1"  # 最快压缩
+                echo -e "${CYAN}[$dir_name] Using LZ4 fast compression...${NC}"
+            else
+                temp_archive=$(mktemp --suffix=.tar.gz)
+                compression_level="-1"  # gzip最快级别
+                echo -e "${CYAN}[$dir_name] Using gzip fast compression...${NC}"
+            fi
+            ;;
+        "standard")
+            # 标准模式：平衡压缩率和速度
+            if command -v lz4 >/dev/null 2>&1; then
+                temp_archive=$(mktemp --suffix=.tar.lz4)
+                compression_level="-3"  # 平衡压缩
+                echo -e "${CYAN}[$dir_name] Using LZ4 standard compression...${NC}"
+            else
+                temp_archive=$(mktemp --suffix=.tar.gz)
+                compression_level="-3"  # gzip平衡级别
+                echo -e "${CYAN}[$dir_name] Using gzip standard compression...${NC}"
+            fi
+            ;;
+    esac
+    
+    # 执行压缩
+    if [[ "$temp_archive" == *.lz4 ]]; then
+        # 使用lz4压缩
+        if ! tar -cf - $exclude_args_tar -C "$local_dir" . | lz4 $compression_level > "$temp_archive" 2>/dev/null; then
             echo -e "${RED}[$dir_name] Failed to create lz4 archive${NC}"
             rm -f "$temp_archive"
             return 1
         fi
     else
-        # 使用gzip低压缩级别
-        temp_archive=$(mktemp --suffix=.tar.gz)
-        if ! tar -czf "$temp_archive" --gzip -1 $exclude_args_tar -C "$local_dir" . 2>/dev/null; then
-            echo -e "${RED}[$dir_name] Failed to create archive${NC}"
+        # 使用gzip压缩
+        if ! tar -cf - $exclude_args_tar -C "$local_dir" . | gzip $compression_level > "$temp_archive" 2>/dev/null; then
+            echo -e "${RED}[$dir_name] Failed to create gzip archive${NC}"
             rm -f "$temp_archive"
             return 1
         fi
@@ -524,37 +519,75 @@ function perform_compressed_initial_sync() {
         return 1
     fi
     
-    # 使用优化的scp参数上传
+    # 使用优化的传输参数上传
     echo -e "${CYAN}[$dir_name] Uploading archive (${archive_size})...${NC}"
-    local scp_args=(
-        "-P" "$REMOTE_PORT"
-        "-o" "Compression=no"        # 禁用SSH压缩（文件已压缩）
-        "-o" "ConnectTimeout=10"
-        "-o" "ServerAliveInterval=60"
-        "-C"                         # 启用压缩（对于已压缩文件效果有限）
-        "$temp_archive"
-        "$REMOTE_HOST:$remote_target_dir/project.tar.${temp_archive##*.}"
-    )
     
-    if ! scp "${scp_args[@]}" 2>/dev/null; then
+    # 根据文件类型选择最优传输参数
+    local transfer_args=()
+    if [[ "$temp_archive" == *.lz4 ]]; then
+        # LZ4文件：禁用SSH压缩，使用快速传输
+        transfer_args=(
+            "-P" "$REMOTE_PORT"
+            "-o" "Compression=no"        # 禁用SSH压缩
+            "-o" "ConnectTimeout=10"
+            "-o" "ServerAliveInterval=60"
+            "$temp_archive"
+            "$REMOTE_HOST:$remote_target_dir/project.tar.lz4"
+        )
+    else
+        # GZIP文件：同样禁用SSH压缩
+        transfer_args=(
+            "-P" "$REMOTE_PORT"
+            "-o" "Compression=no"        # 禁用SSH压缩
+            "-o" "ConnectTimeout=10"
+            "-o" "ServerAliveInterval=60"
+            "$temp_archive"
+            "$REMOTE_HOST:$remote_target_dir/project.tar.gz"
+        )
+    fi
+    
+    # 显示传输进度（如果有pv工具）
+    if command -v pv >/dev/null 2>&1; then
+        echo -e "${CYAN}[$dir_name] Transferring with progress monitor...${NC}"
+        pv "$temp_archive" | ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "cat > $remote_target_dir/project.tar.${temp_archive##*.}"
+        local upload_result=$?
+    else
+        # 使用标准scp传输
+        scp "${transfer_args[@]}" 2>/dev/null
+        local upload_result=$?
+    fi
+    
+    if [ $upload_result -ne 0 ]; then
         echo -e "${RED}[$dir_name] Failed to upload archive${NC}"
         rm -f "$temp_archive"
         return 1
     fi
     
     # 远程解压
-    echo -e "${CYAN}[$dir_name] Extracting on remote...${NC}"
+    echo -e "${CYAN}[$dir_name] Extracting archive on remote server...${NC}"
     local extract_cmd=""
+    local archive_name=""
+    
     if [[ "$temp_archive" == *.lz4 ]]; then
-        extract_cmd="lz4 -d project.tar.lz4 | tar -xf -"
+        archive_name="project.tar.lz4"
+        # 检查远程是否有lz4工具
+        extract_cmd="
+            if command -v lz4 >/dev/null 2>&1; then
+                lz4 -d $archive_name | tar -xf -
+            else
+                echo 'ERROR: lz4 not found on remote server'
+                exit 1
+            fi
+        "
     else
-        extract_cmd="tar -xzf project.tar.gz"
+        archive_name="project.tar.gz"
+        extract_cmd="tar -xzf $archive_name"
     fi
     
     local remote_extract_result=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
         cd $(escape_shell_arg "$remote_target_dir") && 
         $extract_cmd && 
-        rm -f project.tar.* && 
+        rm -f $archive_name && 
         echo 'SUCCESS'
     " 2>/dev/null)
     
