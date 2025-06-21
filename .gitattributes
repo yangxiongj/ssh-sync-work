@@ -1,0 +1,30 @@
+# 压缩文件和编译文件不显示差异
+*.min.css -diff
+*.min.js -diff
+*.css.map -diff
+*.js.map -diff
+messages.mo -diff
+
+# 换行符控制
+* text=auto eol=lf
+
+# 二进制文件不处理换行符
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.bz2 binary
+*.xz binary
+*.7z binary
+*.rar binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.ftz binary
