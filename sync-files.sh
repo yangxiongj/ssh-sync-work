@@ -13,6 +13,7 @@ CONFIG_FILE="/mnt/d/sync.yaml"
 DEFAULT_REMOTE_HOST="34.68.158.244"
 DEFAULT_REMOTE_PORT="22"
 DEFAULT_REMOTE_DIR="/root/work"
+DEFAULT_REMOTE_OS="ubuntu"
 DEFAULT_REFRESH_INTERVAL=60
 DEFAULT_LOCAL_DIRS=()
 DEFAULT_EXCLUDE_PATTERNS=(
@@ -32,6 +33,7 @@ DEFAULT_EXCLUDE_PATTERNS=(
 REMOTE_HOST=""
 REMOTE_PORT=""
 REMOTE_DIR=""
+REMOTE_OS=""
 REFRESH_INTERVAL=""
 LOCAL_DIRS=()
 EXCLUDE_PATTERNS=()
@@ -169,6 +171,11 @@ function load_config() {
                 # 去除引号
                 dir_value=$(echo "$dir_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
                 REMOTE_DIR="$dir_value"
+            elif [[ "$line" =~ ^os:[[:space:]]*(.+)$ ]]; then
+                local os_value="${BASH_REMATCH[1]}"
+                # 去除引号
+                os_value=$(echo "$os_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
+                REMOTE_OS="$os_value"
             fi
         fi
         
@@ -206,6 +213,7 @@ function load_default_config() {
     REMOTE_HOST="$DEFAULT_REMOTE_HOST"
     REMOTE_PORT="$DEFAULT_REMOTE_PORT"
     REMOTE_DIR="$DEFAULT_REMOTE_DIR"
+    REMOTE_OS="$DEFAULT_REMOTE_OS"
     REFRESH_INTERVAL="$DEFAULT_REFRESH_INTERVAL"
     LOCAL_DIRS=("${DEFAULT_LOCAL_DIRS[@]}")
     EXCLUDE_PATTERNS=("${DEFAULT_EXCLUDE_PATTERNS[@]}")
@@ -216,6 +224,7 @@ function validate_config() {
     [ -z "$REMOTE_HOST" ] && REMOTE_HOST="$DEFAULT_REMOTE_HOST"
     [ -z "$REMOTE_PORT" ] && REMOTE_PORT="$DEFAULT_REMOTE_PORT"
     [ -z "$REMOTE_DIR" ] && REMOTE_DIR="$DEFAULT_REMOTE_DIR"
+    [ -z "$REMOTE_OS" ] && REMOTE_OS="$DEFAULT_REMOTE_OS"
     [ -z "$REFRESH_INTERVAL" ] && REFRESH_INTERVAL="$DEFAULT_REFRESH_INTERVAL"
     
     # 如果数组为空，使用默认值
@@ -236,6 +245,7 @@ function save_config_cache() {
         echo "REMOTE_HOST=$REMOTE_HOST"
         echo "REMOTE_PORT=$REMOTE_PORT"
         echo "REMOTE_DIR=$REMOTE_DIR"
+        echo "REMOTE_OS=$REMOTE_OS"
         echo "REFRESH_INTERVAL=$REFRESH_INTERVAL"
         for dir in "${LOCAL_DIRS[@]}"; do
             echo "LOCAL_DIR=$dir"
@@ -291,6 +301,7 @@ function load_cached_config() {
         local cached_host=""
         local cached_port=""
         local cached_dir=""
+        local cached_os=""
         local cached_interval=""
         
         while IFS= read -r line; do
@@ -302,6 +313,8 @@ function load_cached_config() {
                 cached_port="${line#REMOTE_PORT=}"
             elif [[ "$line" =~ ^REMOTE_DIR= ]]; then
                 cached_dir="${line#REMOTE_DIR=}"
+            elif [[ "$line" =~ ^REMOTE_OS= ]]; then
+                cached_os="${line#REMOTE_OS=}"
             elif [[ "$line" =~ ^REFRESH_INTERVAL= ]]; then
                 cached_interval="${line#REFRESH_INTERVAL=}"
             elif [[ "$line" =~ ^LOCAL_DIR= ]]; then
@@ -319,6 +332,7 @@ function load_cached_config() {
                 REMOTE_HOST="$cached_host"
                 REMOTE_PORT="$cached_port"
                 REMOTE_DIR="$cached_dir"
+                REMOTE_OS="$cached_os"
                 REFRESH_INTERVAL="$cached_interval"
                 LOCAL_DIRS=("${cached_dirs[@]}")
                 EXCLUDE_PATTERNS=("${cached_patterns[@]}")
@@ -573,7 +587,7 @@ function perform_compressed_initial_sync() {
         # 检查远程是否有lz4工具
         extract_cmd="
             if command -v lz4 >/dev/null 2>&1; then
-                lz4 -d $archive_name | tar -xf -
+                lz4 -dc $archive_name | tar -xf -
             else
                 echo 'ERROR: lz4 not found on remote server'
                 exit 1

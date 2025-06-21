@@ -168,6 +168,7 @@ source "$SYNC_SCRIPT"
 function check_and_install_remote_tools() {
     local remote_host="$1"
     local remote_port="$2"
+    local remote_os="$3"  # 配置的远程操作系统类型
     
     echo -e "${CYAN}检查远程服务器 $remote_host:$remote_port 的优化工具...${NC}"
     
@@ -177,19 +178,31 @@ function check_and_install_remote_tools() {
         return 1
     fi
     
-    # 检查远程系统类型和工具
+    # 使用配置的操作系统类型，而不是检测
+    local system=""
+    case "${remote_os,,}" in  # 转换为小写
+        ubuntu|debian)
+            system="debian"
+            ;;
+        centos|rhel|redhat)
+            system="rhel"
+            ;;
+        fedora)
+            system="fedora"
+            ;;
+        alpine)
+            system="alpine"
+            ;;
+        *)
+            echo -e "${YELLOW}警告: 未知的远程操作系统类型 '$remote_os'，默认使用 debian${NC}"
+            system="debian"
+            ;;
+    esac
+    
+    echo -e "${GRAY}配置的远程系统: $remote_os -> $system${NC}"
+    
+    # 检查远程工具状态（不再检测系统类型）
     local remote_check_result=$(ssh "$remote_host" -p "$remote_port" '
-        # 检查系统类型
-        if command -v apt >/dev/null 2>&1; then
-            SYSTEM="debian"
-        elif command -v yum >/dev/null 2>&1; then
-            SYSTEM="rhel"
-        elif command -v dnf >/dev/null 2>&1; then
-            SYSTEM="fedora"
-        else
-            SYSTEM="unknown"
-        fi
-        
         # 检查lz4
         if command -v lz4 >/dev/null 2>&1; then
             LZ4_STATUS="installed"
@@ -204,7 +217,7 @@ function check_and_install_remote_tools() {
             PV_STATUS="missing"
         fi
         
-        echo "$SYSTEM:$LZ4_STATUS:$PV_STATUS"
+        echo "$LZ4_STATUS:$PV_STATUS"
     ' 2>/dev/null)
     
     if [ -z "$remote_check_result" ]; then
@@ -213,9 +226,9 @@ function check_and_install_remote_tools() {
     fi
     
     # 解析结果
-    IFS=':' read -r system lz4_status pv_status <<< "$remote_check_result"
+    IFS=':' read -r lz4_status pv_status <<< "$remote_check_result"
     
-    echo -e "${GRAY}远程系统: $system, lz4: $lz4_status, pv: $pv_status${NC}"
+    echo -e "${GRAY}远程工具状态: lz4: $lz4_status, pv: $pv_status${NC}"
     
     # 安装缺失的工具
     local install_commands=""
@@ -242,6 +255,9 @@ function check_and_install_remote_tools() {
                 ;;
             "fedora")
                 install_commands="sudo dnf install -y $tools_to_install >/dev/null 2>&1"
+                ;;
+            "alpine")
+                install_commands="sudo apk update >/dev/null 2>&1 && sudo apk add $tools_to_install >/dev/null 2>&1"
                 ;;
             *)
                 echo -e "${YELLOW}警告: 未知系统类型，无法自动安装工具${NC}"
@@ -320,7 +336,7 @@ function install_file_sync_service() {
     echo -e "${CYAN}步骤2: 检查远程服务器优化工具${NC}"
     
     if [ -n "$REMOTE_HOST" ]; then
-        check_and_install_remote_tools "$REMOTE_HOST" "$REMOTE_PORT"
+        check_and_install_remote_tools "$REMOTE_HOST" "$REMOTE_PORT" "$REMOTE_OS"
     else
         echo -e "${YELLOW}跳过远程工具检查（无有效配置）${NC}"
     fi
