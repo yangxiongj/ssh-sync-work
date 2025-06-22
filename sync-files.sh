@@ -420,14 +420,17 @@ function sync_files() {
         
         local all_files="$modified_files"$'\n'"$staged_files"$'\n'"$untracked_files"$'\n'"$unpushed_files"
         local unique_files=$(echo "$all_files" | grep -v '^$' | sort -u)
+
+        local local_hash=$(git rev-parse HEAD 2>/dev/null)
         
+        # 总是更新远程仓库版本，即使没有文件变更
+        update_remote_repository "$remote_target_dir" "$dir_name" "$unique_files" "$local_hash" "$current_branch"
+        
+        # 如果没有文件变更，跳过文件同步
         [ -z "$unique_files" ] && continue
         
         local file_count=$(echo "$unique_files" | wc -l)
         echo "[$dir_name] 同步 $file_count 个文件"
-        
-        local local_hash=$(git rev-parse HEAD 2>/dev/null)
-        update_remote_repository "$remote_target_dir" "$dir_name" "$unique_files" "$local_hash" "$current_branch"
         
         if [ -n "$unique_files" ]; then
             local remote_target="${REMOTE_HOST}:${remote_target_dir}/"

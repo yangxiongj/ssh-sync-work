@@ -158,17 +158,16 @@ function sync_version() {
     
     echo "REMOTE_STATUS:$remote_branch:$remote_hash"
     
-    # 哈希匹配检查
-    if [ "$remote_hash" = "$local_hash" ]; then
-        write_log "INFO" "哈希匹配，无需同步" "SYNC"
-        echo 'HASH_MATCH'
-        exit 0
-    fi
-    
-    write_log "INFO" "哈希不匹配，开始同步。远程: ${remote_hash:0:8}, 本地: ${local_hash:0:8}" "SYNC"
+    write_log "INFO" "开始同步。远程: ${remote_hash:0:8}, 本地: ${local_hash:0:8}" "SYNC"
     
     # 智能文件回滚
     smart_rollback "$files_to_keep" "$exclude_patterns"
+
+    if [ "$remote_hash" = "$local_hash" ]; then
+            write_log "INFO" "哈希相同，无需处理。远程: ${remote_hash:0:8}, 本地: ${local_hash:0:8}" "SYNC"
+            echo 'HASH_MATCH'
+            return 0
+    fi
     
     # 版本同步逻辑
     if [ "$remote_branch" = "$local_branch" ]; then
@@ -286,8 +285,13 @@ function smart_rollback() {
             fi
             
             if [ "$should_keep" = false ]; then
-                if rm -f "$file" 2>/dev/null; then
-                    ((rollback_count++))
+                # 确保文件在Git工作区内且是相对路径
+                if [[ "$file" != /* ]] && [ -f "$file" ] && [[ "$file" != ../* ]]; then
+                    if rm -f "$file" 2>/dev/null; then
+                        ((rollback_count++))
+                    fi
+                else
+                    write_log "WARN" "跳过删除工作区外文件: $file" "ROLLBACK"
                 fi
             else
                 ((kept_count++))
@@ -358,9 +362,6 @@ case "${1:-}" in
     "sync_version")
         sync_version "$2" "$3" "$4" "$5" "$6"
         ;;
-    "check_repo")
-        check_git_repo "$2"
-        ;;
     "rotate_logs")
         rotate_logs
         ;;
@@ -369,7 +370,7 @@ case "${1:-}" in
         ;;
     *)
         echo "远程同步助手"
-        echo "用法: $0 {sync_version|check_repo|rotate_logs|show_logs}"
+        echo "用法: $0 {sync_version|rotate_logs|show_logs}"
         exit 1
         ;;
 esac 
