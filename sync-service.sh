@@ -189,11 +189,13 @@ function show_logs() {
     
     if [ -n "$REMOTE_HOST" ] && [ -n "$REMOTE_PORT" ]; then
         if [ -n "$REMOTE_LOG_DIR" ]; then
+            echo "  日志列表: ssh $REMOTE_HOST -p $REMOTE_PORT '$REMOTE_LOG_DIR/view-logs.sh list'"
             echo "  最近活动: ssh $REMOTE_HOST -p $REMOTE_PORT '$REMOTE_LOG_DIR/view-logs.sh recent'"
             echo "  实时同步: ssh $REMOTE_HOST -p $REMOTE_PORT '$REMOTE_LOG_DIR/view-logs.sh sync'"
             echo "  错误日志: ssh $REMOTE_HOST -p $REMOTE_PORT '$REMOTE_LOG_DIR/view-logs.sh error'"
             echo "  操作记录: ssh $REMOTE_HOST -p $REMOTE_PORT '$REMOTE_LOG_DIR/view-logs.sh operations'"
         else
+            echo "  日志列表: ssh $REMOTE_HOST -p $REMOTE_PORT 'ls -la ~/sync-logs/*.log'"
             echo "  实时同步: ssh $REMOTE_HOST -p $REMOTE_PORT 'tail -f ~/sync-logs/sync.log'"
             echo "  错误日志: ssh $REMOTE_HOST -p $REMOTE_PORT 'tail -f ~/sync-logs/error.log'"
         fi

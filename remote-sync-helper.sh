@@ -32,9 +32,16 @@ declare -A SYNC_STATUS=(
     ["HASH_NOT_FOUND"]="哈希未找到"
 )
 
-# 确保日志目录存在
+# 确保日志目录和文件存在
 function ensure_log_dir() {
-    [ ! -d "$LOG_DIR" ] && mkdir -p "$LOG_DIR" 2>/dev/null
+    if [ ! -d "$LOG_DIR" ]; then
+        mkdir -p "$LOG_DIR" 2>/dev/null
+    fi
+    
+    # 确保基础日志文件存在
+    [ ! -f "$SYNC_LOG" ] && touch "$SYNC_LOG" 2>/dev/null
+    [ ! -f "$ERROR_LOG" ] && touch "$ERROR_LOG" 2>/dev/null
+    [ ! -f "$OPERATIONS_LOG" ] && touch "$OPERATIONS_LOG" 2>/dev/null
 }
 
 # 统一的日志记录函数

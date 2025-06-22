@@ -77,6 +77,15 @@ fi
 # 设置远程环境变量
 echo "export SYNC_LOG_DIR=\"$LOG_DIR\"" > ~/.sync-env
 
+# 创建基础日志文件
+touch "$LOG_DIR/sync.log"
+touch "$LOG_DIR/error.log" 
+touch "$LOG_DIR/operations.log"
+
+# 写入初始化日志条目
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] [INSTALL] 远程日志环境初始化完成" >> "$LOG_DIR/sync.log"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] [INSTALL] 日志目录: $LOG_DIR" >> "$LOG_DIR/sync.log"
+
 # 创建远程日志查看脚本
 cat > "$LOG_DIR/view-logs.sh" << "EOF"
 #!/bin/bash
@@ -86,7 +95,8 @@ case "${1:-sync}" in
     "error") tail -f "$LOG_DIR/error.log" 2>/dev/null || echo "错误日志不存在" ;;
     "operations") tail -f "$LOG_DIR/operations.log" 2>/dev/null || echo "操作日志不存在" ;;
     "recent") tail -20 "$LOG_DIR/sync.log" 2>/dev/null | grep -E "(OPERATION|ERROR)" || echo "无最近活动" ;;
-    *) echo "用法: $0 {sync|error|operations|recent}" ;;
+    "list") ls -la "$LOG_DIR"/*.log 2>/dev/null || echo "无日志文件" ;;
+    *) echo "用法: $0 {sync|error|operations|recent|list}" ;;
 esac
 EOF
 
