@@ -1,64 +1,246 @@
 #!/bin/bash
 
-# 文件同步服务管理脚本 - 支持systemd服务管理
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 加载环境变量
+if [ -f "$(dirname "$0")/.sync-env" ]; then
+    source "$(dirname "$0")/.sync-env"
+fi
+
+# 服务配置
 SERVICE_NAME="file-sync-service"
-MAIN_SCRIPT="$SCRIPT_DIR/sync-files.sh"
-LOG_FILE="$SCRIPT_DIR/service.log"
-PID_FILE="$SCRIPT_DIR/service.pid"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SYNC_SCRIPT="$SCRIPT_DIR/sync-files.sh"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 REMOTE_HELPER_SCRIPT="$SCRIPT_DIR/remote-sync-helper.sh"
 
 # 导入配置处理函数
-source "$MAIN_SCRIPT"
+source "$SYNC_SCRIPT"
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-GRAY='\033[0;37m'
-NC='\033[0m'
+# 服务状态码定义
+declare -A SERVICE_STATUS=(
+    ["SUCCESS"]="成功"
+    ["ERROR"]="错误"
+    ["WARNING"]="警告"
+    ["RUNNING"]="运行中"
+    ["STOPPED"]="已停止"
+    ["ENABLED"]="已启用"
+    ["DISABLED"]="未启用"
+)
 
-function write_service_log() {
-    local message="$1"
-    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
-    local log_entry="[$timestamp] $message"
-    echo -e "$log_entry"
-    echo "$log_entry" >> "$LOG_FILE"
+# 统一的状态输出函数（只输出到命令行，不写文件）
+function log_service() {
+    local level="$1"
+    local message="$2"
+    
+    case "$level" in
+        "ERROR")
+            echo "✗ $message" >&2
+            ;;
+        "SUCCESS")
+            echo "✓ $message"
+            ;;
+        "INFO")
+            echo "ℹ $message"
+            ;;
+        "WARNING")
+            echo "⚠ $message"
+            ;;
+    esac
 }
 
-
-
-
-function uninstall_sync_service() {
-    write_service_log "开始卸载文件同步服务..."
+# 远程清理函数
+function cleanup_remote() {
+    local remote_host="$1"
+    local remote_port="$2"
     
-    # 检查是否有sudo权限
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}错误: 需要sudo权限来卸载systemd服务${NC}"
-        echo "请使用: sudo $0 uninstall"
-        exit 1
+    if [ -n "$remote_host" ] && [ -n "$remote_port" ]; then
+        log_service "INFO" "清理远程临时文件"
+        ssh -o ConnectTimeout=5 -p "$remote_port" "$remote_host" "rm -f /tmp/remote-sync-helper.sh" 2>/dev/null || true
+    fi
+}
+
+# 获取服务状态
+function get_service_status() {
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        echo "RUNNING"
+    elif systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        echo "STOPPED"
+    elif systemctl list-unit-files | grep -q "^$SERVICE_NAME"; then
+        echo "DISABLED"
+    else
+        echo "NOT_FOUND"
+    fi
+}
+
+# 显示服务状态
+function show_service_status() {
+    local status=$(get_service_status)
+    local status_msg="${SERVICE_STATUS[$status]:-$status}"
+    
+    echo "检查服务状态..."
+    echo "服务状态: $status_msg"
+    
+    if [ "$status" = "RUNNING" ]; then
+        echo ""
+        echo "进程信息:"
+        systemctl status "$SERVICE_NAME" --no-pager -l | head -10
     fi
     
+    # 检查服务是否开机自启
+    if systemctl is-enabled --quiet "$SERVICE_NAME"; then
+        echo "开机自启: ${SERVICE_STATUS["ENABLED"]}"
+    else
+        echo "开机自启: ${SERVICE_STATUS["DISABLED"]}"
+    fi
+    
+    # 显示远程服务器日志状态
+    echo ""
+    echo "远程服务器日志状态:"
+    if [ -n "$REMOTE_HOST" ]; then
+        local remote_log_info=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
+            if [ -d /var/log/sync-service ]; then 
+                echo "系统日志: $(ls -la /var/log/sync-service/*.log 2>/dev/null | wc -l) 个文件"
+                echo "最新日志: $(ls -t /var/log/sync-service/*.log 2>/dev/null | head -1)"
+            elif [ -d ~/sync-logs ]; then
+                echo "用户日志: $(ls -la ~/sync-logs/*.log 2>/dev/null | wc -l) 个文件"
+                echo "最新日志: $(ls -t ~/sync-logs/*.log 2>/dev/null | head -1)"
+            else
+                echo "无远程日志目录"
+            fi
+        " 2>/dev/null)
+        echo "$remote_log_info"
+    else
+        echo "无远程服务器配置"
+    fi
+}
+
+# 启动服务
+function start_service() {
+    local status=$(get_service_status)
+    
+    case "$status" in
+        "RUNNING")
+            log_service "INFO" "服务已在运行"
+            return 0
+            ;;
+        "NOT_FOUND")
+            log_service "ERROR" "服务未安装，请先运行 sudo ./install.sh"
+            return 1
+            ;;
+    esac
+    
+    log_service "INFO" "启动文件同步服务"
+    
+    if systemctl start "$SERVICE_NAME" 2>/dev/null; then
+        sleep 2
+        if systemctl is-active --quiet "$SERVICE_NAME"; then
+            log_service "SUCCESS" "服务启动成功"
+            return 0
+        fi
+    fi
+    
+    log_service "ERROR" "服务启动失败"
+    return 1
+}
+
+# 停止服务
+function stop_service() {
+    local status=$(get_service_status)
+    
+    if [ "$status" = "NOT_FOUND" ]; then
+        log_service "ERROR" "服务未安装"
+        return 1
+    fi
+    
+    if [ "$status" = "STOPPED" ]; then
+        log_service "INFO" "服务已停止"
+        return 0
+    fi
+    
+    log_service "INFO" "停止文件同步服务"
+    
+    # 获取远程配置以便清理
+    local remote_config=$(grep -E "^(REMOTE_HOST|REMOTE_PORT)=" "$SCRIPT_DIR/.sync_cache" 2>/dev/null | tr '\n' ' ')
+    local remote_host=$(echo "$remote_config" | grep -o 'REMOTE_HOST=[^[:space:]]*' | cut -d= -f2)
+    local remote_port=$(echo "$remote_config" | grep -o 'REMOTE_PORT=[^[:space:]]*' | cut -d= -f2)
+    
+    if systemctl stop "$SERVICE_NAME" 2>/dev/null; then
+        cleanup_remote "$remote_host" "$remote_port"
+        log_service "SUCCESS" "服务已停止"
+        return 0
+    fi
+    
+    log_service "ERROR" "服务停止失败"
+    return 1
+}
+
+# 重启服务
+function restart_service() {
+    log_service "INFO" "重启文件同步服务"
+    stop_service
+    sleep 1
+    start_service
+}
+
+# 查看日志（远程日志访问提示）
+function show_logs() {
+    echo "本地客户端不保存详细日志，所有同步日志记录在远程服务器上"
+    echo ""
+    echo "查看远程同步日志:"
+    
+    if [ -n "$REMOTE_HOST" ] && [ -n "$REMOTE_PORT" ]; then
+        if [ -n "$REMOTE_LOG_DIR" ]; then
+            echo "  最近活动: ssh $REMOTE_HOST -p $REMOTE_PORT '$REMOTE_LOG_DIR/view-logs.sh recent'"
+            echo "  实时同步: ssh $REMOTE_HOST -p $REMOTE_PORT '$REMOTE_LOG_DIR/view-logs.sh sync'"
+            echo "  错误日志: ssh $REMOTE_HOST -p $REMOTE_PORT '$REMOTE_LOG_DIR/view-logs.sh error'"
+            echo "  操作记录: ssh $REMOTE_HOST -p $REMOTE_PORT '$REMOTE_LOG_DIR/view-logs.sh operations'"
+        else
+            echo "  实时同步: ssh $REMOTE_HOST -p $REMOTE_PORT 'tail -f ~/sync-logs/sync.log'"
+            echo "  错误日志: ssh $REMOTE_HOST -p $REMOTE_PORT 'tail -f ~/sync-logs/error.log'"
+        fi
+    else
+        echo "  无远程服务器配置，请先安装服务"
+    fi
+    
+    echo ""
+    echo "systemd服务日志:"
+    echo "  journalctl -u $SERVICE_NAME -f"
+}
+
+# 实时查看systemd日志
+function follow_logs() {
+    echo "实时查看systemd服务日志 (Ctrl+C 退出)..."
+    journalctl -u "$SERVICE_NAME" -f --no-pager 2>/dev/null || {
+        echo "无法获取systemd日志，可能需要sudo权限"
+        echo "尝试: sudo journalctl -u $SERVICE_NAME -f"
+    }
+}
+
+# 卸载服务
+function uninstall_service() {
+    if [ "$EUID" -ne 0 ]; then
+        log_service "ERROR" "需要sudo权限来卸载服务"
+        return 1
+    fi
+    
+    log_service "INFO" "开始卸载文件同步服务"
+    
     # 步骤1: 停止服务
-    echo -e "${CYAN}步骤1: 停止服务${NC}"
-    stop_sync_service
+    echo "步骤1: 停止服务"
+    stop_service
     
     # 步骤2: 禁用服务
-    echo -e "${CYAN}步骤2: 禁用服务${NC}"
+    echo "步骤2: 禁用服务"
     systemctl disable "$SERVICE_NAME" 2>/dev/null
     
     # 步骤3: 删除服务文件
-    echo -e "${CYAN}步骤3: 删除systemd服务文件${NC}"
+    echo "步骤3: 删除systemd服务文件"
     if [ -f "$SERVICE_FILE" ]; then
         rm -f "$SERVICE_FILE"
-        echo -e "${GREEN}✓ 已删除服务文件: $SERVICE_FILE${NC}"
+        log_service "SUCCESS" "已删除服务文件: $SERVICE_FILE"
     fi
     
     # 步骤4: 清理远程脚本
-    echo -e "${CYAN}步骤4: 清理远程服务器脚本${NC}"
+    echo "步骤4: 清理远程服务器脚本"
     
     # 加载配置以获取远程服务器信息
     if ! load_cached_config; then
@@ -67,188 +249,61 @@ function uninstall_sync_service() {
     
     if [ -n "$REMOTE_HOST" ]; then
         local remote_script_path="/tmp/remote-sync-helper.sh"
-        echo -e "${YELLOW}正在清理远程服务器脚本...${NC}"
+        echo "正在清理远程服务器脚本..."
         
         # 删除远程脚本
         if ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "rm -f $remote_script_path" 2>/dev/null; then
-            echo -e "${GREEN}✓ 已删除远程脚本: $REMOTE_HOST:$remote_script_path${NC}"
+            log_service "SUCCESS" "已删除远程脚本: $REMOTE_HOST:$remote_script_path"
         else
-            echo -e "${YELLOW}警告: 无法删除远程脚本或脚本不存在${NC}"
+            log_service "WARNING" "无法删除远程脚本或脚本不存在"
+        fi
+        
+        # 清理远程日志目录
+        echo "正在清理远程服务器日志..."
+        if ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "rm -rf /var/log/sync-service 2>/dev/null || rm -rf ~/sync-logs 2>/dev/null" 2>/dev/null; then
+            log_service "SUCCESS" "已清理远程日志目录"
         fi
     else
-        echo -e "${YELLOW}跳过远程脚本清理（无有效配置）${NC}"
+        log_service "WARNING" "跳过远程脚本清理（无有效配置）"
     fi
     
-    # 步骤5: 清理本地缓存和日志
-    echo -e "${CYAN}步骤5: 清理本地文件${NC}"
+    # 步骤5: 清理本地缓存
+    echo "步骤5: 清理本地缓存文件"
     
     # 删除配置缓存文件
-    if [ -f "$CONFIG_CACHE_FILE" ]; then
-        rm -f "$CONFIG_CACHE_FILE"
-        echo -e "${GREEN}✓ 已删除配置缓存: $CONFIG_CACHE_FILE${NC}"
-    fi
-    
-    # 删除PID文件
-    if [ -f "$PID_FILE" ]; then
-        rm -f "$PID_FILE"
-        echo -e "${GREEN}✓ 已删除PID文件: $PID_FILE${NC}"
-    fi
-    
-    # 询问是否删除日志文件
-    if [ -f "$LOG_FILE" ]; then
-        echo -e "${YELLOW}是否删除服务日志文件? $LOG_FILE (y/N): ${NC}"
-        read -r delete_log
-        if [[ "$delete_log" =~ ^[Yy]$ ]]; then
-            rm -f "$LOG_FILE"
-            echo -e "${GREEN}✓ 已删除日志文件: $LOG_FILE${NC}"
-        else
-            echo -e "${GRAY}保留日志文件: $LOG_FILE${NC}"
-        fi
-    fi
+    rm -f "$SCRIPT_DIR/.sync_cache" 2>/dev/null && log_service "SUCCESS" "已删除配置缓存"
+    rm -f "$SCRIPT_DIR/.sync-env" 2>/dev/null && log_service "SUCCESS" "已删除环境变量文件"
     
     # 步骤6: 重新加载systemd配置
-    echo -e "${CYAN}步骤6: 重新加载systemd配置${NC}"
+    echo "步骤6: 重新加载systemd配置"
     systemctl daemon-reload
     
     echo ""
-    echo -e "${GREEN}=== 卸载完成 ===${NC}"
-    echo -e "${WHITE}已清理以下组件:${NC}"
-    echo -e "${WHITE}  ✓ systemd服务文件${NC}"
-    echo -e "${WHITE}  ✓ 远程助手脚本${NC}"
-    echo -e "${WHITE}  ✓ 配置缓存文件${NC}"
-    echo -e "${WHITE}  ✓ PID文件${NC}"
+    echo "=== 卸载完成 ==="
+    echo "已清理以下组件:"
+    echo "  ✓ systemd服务文件"
+    echo "  ✓ 远程助手脚本"
+    echo "  ✓ 远程日志目录"
+    echo "  ✓ 配置缓存文件"
     
-    write_service_log "服务卸载完成，已清理所有相关文件。"
-}
-
-function start_sync_service() {
-    write_service_log "启动文件同步服务..."
-    
-    # 检查服务是否已安装
-    if [ ! -f "$SERVICE_FILE" ]; then
-        echo -e "${RED}错误: 服务未安装，请先运行安装命令${NC}"
-        echo "使用: sudo ./install.sh"
-        exit 1
-    fi
-    
-    # 启动服务
-    systemctl start "$SERVICE_NAME"
-    
-    if [ $? -eq 0 ]; then
-        write_service_log "服务启动成功"
-    else
-        write_service_log "服务启动失败"
-        exit 1
-    fi
-}
-
-function stop_sync_service() {
-    write_service_log "停止文件同步服务..."
-    
-    # 停止systemd服务
-    systemctl stop "$SERVICE_NAME" 2>/dev/null
-    
-    # 清理PID文件
-    if [ -f "$PID_FILE" ]; then
-        rm -f "$PID_FILE"
-    fi
-    
-    write_service_log "服务已停止"
-}
-
-function restart_sync_service() {
-    write_service_log "重启文件同步服务..."
-    
-    systemctl restart "$SERVICE_NAME"
-    
-    if [ $? -eq 0 ]; then
-        write_service_log "服务重启成功"
-    else
-        write_service_log "服务重启失败"
-        exit 1
-    fi
-}
-
-function get_service_status() {
-    write_service_log "检查服务状态..."
-    
-    # 检查systemd服务状态
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        echo -e "${GREEN}服务运行中${NC}"
-        systemctl status "$SERVICE_NAME" --no-pager -l
-    else
-        echo -e "${RED}服务未运行${NC}"
-    fi
-    
-    # 检查服务是否开机自启
-    if systemctl is-enabled --quiet "$SERVICE_NAME"; then
-        echo -e "${GREEN}开机自启: 已启用${NC}"
-    else
-        echo -e "${YELLOW}开机自启: 未启用${NC}"
-    fi
-    
-    # 显示最近的日志
-    echo -e "\n${CYAN}最近的服务日志:${NC}"
-    if [ -f "$LOG_FILE" ]; then
-        tail -n 10 "$LOG_FILE"
-    else
-        echo "暂无日志文件"
-    fi
-}
-
-function show_logs() {
-    if [ -f "$LOG_FILE" ]; then
-        echo -e "${CYAN}服务日志内容:${NC}"
-        if [ "$1" = "follow" ]; then
-            tail -f "$LOG_FILE"
-        else
-            tail -n 50 "$LOG_FILE"
-        fi
-    else
-        echo -e "${YELLOW}日志文件不存在${NC}"
-    fi
-}
-
-function show_usage() {
-    echo -e "${CYAN}文件同步服务管理脚本${NC}"
-    echo ""
-    echo "用法: $0 [命令]"
-    echo ""
-    echo "命令:"
-    echo "  install     安装服务并设置开机自启 (需要sudo)"
-    echo "  uninstall   卸载服务 (需要sudo)"
-    echo "  start       启动服务"
-    echo "  stop        停止服务"
-    echo "  restart     重启服务"
-    echo "  status      查看服务状态"
-    echo "  logs        查看服务日志"
-    echo "  logs-f      实时查看服务日志"
-    echo ""
-    echo -e "${GRAY}注意: install命令会自动调用 ./install.sh${NC}"
-    echo ""
-    echo "示例:"
-    echo "  sudo $0 install    # 安装服务"
-    echo "  $0 start           # 启动服务"
-    echo "  $0 status          # 查看状态"
-    echo "  $0 logs-f          # 实时查看日志"
-    echo "  sudo $0 uninstall  # 卸载服务"
+    log_service "SUCCESS" "服务卸载完成，已清理所有相关文件"
 }
 
 # 安装服务函数（调用install.sh）
-function install_sync_service() {
-    echo -e "${CYAN}调用统一安装脚本...${NC}"
+function install_service() {
+    echo "调用统一安装脚本..."
     
     # 检查install.sh是否存在
     local install_script="$SCRIPT_DIR/install.sh"
     if [ ! -f "$install_script" ]; then
-        echo -e "${RED}错误: 找不到安装脚本 $install_script${NC}"
+        log_service "ERROR" "找不到安装脚本 $install_script"
         exit 1
     fi
     
     # 检查是否有sudo权限
     if [ "$EUID" -ne 0 ]; then
-        echo -e "${YELLOW}需要sudo权限来安装系统服务${NC}"
-        echo -e "${YELLOW}正在调用: sudo $install_script${NC}"
+        echo "需要sudo权限来安装系统服务"
+        echo "正在调用: sudo $install_script"
         exec sudo "$install_script"
     else
         # 已经是root权限，直接执行
@@ -256,34 +311,66 @@ function install_sync_service() {
     fi
 }
 
-# 主逻辑
-case "$1" in
-    install)
-        install_sync_service
-        ;;
-    uninstall)
-        uninstall_sync_service
-        ;;
-    start)
-        start_sync_service
-        ;;
-    stop)
-        stop_sync_service
-        ;;
-    restart)
-        restart_sync_service
-        ;;
-    status)
-        get_service_status
-        ;;
-    logs)
-        show_logs
-        ;;
-    logs-f)
-        show_logs follow
-        ;;
-    *)
-        show_usage
-        exit 1
-        ;;
-esac 
+# 显示帮助信息
+function show_help() {
+    echo "文件同步服务管理"
+    echo "用法: $0 {install|start|stop|restart|status|logs|logs-f|uninstall}"
+    echo ""
+    echo "命令:"
+    echo "  install     安装服务并设置开机自启 (需要sudo)"
+    echo "  start       启动服务"
+    echo "  stop        停止服务"
+    echo "  restart     重启服务"
+    echo "  status      查看服务状态"
+    echo "  logs        查看日志访问提示"
+    echo "  logs-f      实时查看systemd服务日志"
+    echo "  uninstall   卸载服务 (需要sudo)"
+    echo ""
+    echo "注意: 详细的同步日志记录在远程服务器上"
+    echo "      install命令会自动调用 ./install.sh"
+    echo ""
+    echo "示例:"
+    echo "  sudo $0 install    # 安装服务"
+    echo "  $0 start           # 启动服务"
+    echo "  $0 status          # 查看状态"
+    echo "  $0 logs            # 查看日志访问提示"
+    echo "  $0 logs-f          # 实时查看systemd日志"
+    echo "  sudo $0 uninstall  # 卸载服务"
+}
+
+# 主执行逻辑
+function main() {
+    case "${1:-status}" in
+        "install")
+            install_service
+            ;;
+        "start")
+            start_service
+            ;;
+        "stop")
+            stop_service
+            ;;
+        "restart")
+            restart_service
+            ;;
+        "status")
+            show_service_status
+            ;;
+        "logs")
+            show_logs
+            ;;
+        "logs-f"|"follow")
+            follow_logs
+            ;;
+        "uninstall")
+            uninstall_service
+            ;;
+        *)
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# 执行主函数
+main "$@" 

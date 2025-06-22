@@ -1,374 +1,426 @@
 #!/bin/bash
 
-# 文件同步服务一键安装脚本
-echo -e "\033[0;36m=== 文件同步服务安装程序 ===\033[0m"
-echo ""
+# 导入配置
+source "./sync-files.sh" 2>/dev/null || {
+    echo "错误: 无法加载 sync-files.sh"
+    exit 1
+}
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-NC='\033[0m'
-
-# 获取脚本所在目录
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SYNC_SCRIPT="$SCRIPT_DIR/sync-files.sh"
-SERVICE_SCRIPT="$SCRIPT_DIR/sync-service.sh"
+SCRIPT_DIR="$(pwd)"
 REMOTE_HELPER_SCRIPT="$SCRIPT_DIR/remote-sync-helper.sh"
 
-# 检查必要文件
-echo -e "${YELLOW}检查必要文件...${NC}"
+# 状态码定义
+declare -A INSTALL_STATUS=(
+    ["SUCCESS"]="成功"
+    ["ERROR"]="错误"
+    ["WARNING"]="警告"
+    ["FOUND"]="已找到"
+    ["MISSING"]="未找到"
+    ["INSTALLED"]="已安装"
+)
 
-if [ ! -f "$SYNC_SCRIPT" ]; then
-    echo -e "${RED}错误: 找不到 sync-files.sh${NC}"
-    exit 1
-fi
-
-if [ ! -f "$SERVICE_SCRIPT" ]; then
-    echo -e "${RED}错误: 找不到 sync-service.sh${NC}"
-    exit 1
-fi
-
-if [ ! -f "$REMOTE_HELPER_SCRIPT" ]; then
-    echo -e "${RED}错误: 找不到 remote-sync-helper.sh${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN}✓ 所有必要文件已找到${NC}"
-
-# 设置脚本执行权限
-chmod +x "$SYNC_SCRIPT"
-chmod +x "$SERVICE_SCRIPT"
-chmod +x "$REMOTE_HELPER_SCRIPT"
-
-# 检查依赖
-echo ""
-echo -e "${YELLOW}检查系统依赖...${NC}"
-
-# 检查git
-if ! command -v git &> /dev/null; then
-    echo -e "${RED}错误: 未找到 git，请先安装${NC}"
-    echo "Ubuntu/Debian: sudo apt install git"
-    echo "CentOS/RHEL: sudo yum install git"
-    exit 1
-fi
-
-# 检查rsync
-if ! command -v rsync &> /dev/null; then
-    echo -e "${RED}错误: 未找到 rsync，请先安装${NC}"
-    echo "Ubuntu/Debian: sudo apt install rsync"
-    echo "CentOS/RHEL: sudo yum install rsync"
-    exit 1
-fi
-
-# 检查ssh
-if ! command -v ssh &> /dev/null; then
-    echo -e "${RED}错误: 未找到 ssh，请先安装${NC}"
-    echo "Ubuntu/Debian: sudo apt install openssh-client"
-    echo "CentOS/RHEL: sudo yum install openssh-clients"
-    exit 1
-fi
-
-# 检查tar
-if ! command -v tar &> /dev/null; then
-    echo -e "${RED}错误: 未找到 tar，请先安装${NC}"
-    echo "Ubuntu/Debian: sudo apt install tar"
-    echo "CentOS/RHEL: sudo yum install tar"
-    exit 1
-fi
-
-# 检查scp
-if ! command -v scp &> /dev/null; then
-    echo -e "${RED}错误: 未找到 scp，请先安装${NC}"
-    echo "Ubuntu/Debian: sudo apt install openssh-client"
-    echo "CentOS/RHEL: sudo yum install openssh-clients"
-    exit 1
-fi
-
-# 检查systemctl
-if ! command -v systemctl &> /dev/null; then
-    echo -e "${RED}错误: 系统不支持 systemd${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN}✓ 基础依赖检查通过${NC}"
-
-# 检查并安装性能优化工具
-echo ""
-echo -e "${YELLOW}检查性能优化工具...${NC}"
-
-# 检查lz4压缩工具
-if ! command -v lz4 &> /dev/null; then
-    echo -e "${YELLOW}未找到 lz4 压缩工具，将自动安装以提升传输性能${NC}"
+# 统一的状态输出函数
+function output_install_status() {
+    local status_code="$1"
+    local component="$2"
+    local message="${INSTALL_STATUS[$status_code]:-$status_code}"
     
-    # 检测系统类型并安装lz4
-    if command -v apt &> /dev/null; then
-        echo -e "${CYAN}检测到 Debian/Ubuntu 系统，安装 lz4...${NC}"
-        if sudo apt update >/dev/null 2>&1 && sudo apt install -y lz4 >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ lz4 安装成功${NC}"
-        else
-            echo -e "${YELLOW}警告: lz4 安装失败，将使用标准压缩${NC}"
-        fi
-    elif command -v yum &> /dev/null; then
-        echo -e "${CYAN}检测到 CentOS/RHEL 系统，安装 lz4...${NC}"
-        if sudo yum install -y lz4 >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ lz4 安装成功${NC}"
-        else
-            echo -e "${YELLOW}警告: lz4 安装失败，将使用标准压缩${NC}"
-        fi
-    elif command -v dnf &> /dev/null; then
-        echo -e "${CYAN}检测到 Fedora 系统，安装 lz4...${NC}"
-        if sudo dnf install -y lz4 >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ lz4 安装成功${NC}"
-        else
-            echo -e "${YELLOW}警告: lz4 安装失败，将使用标准压缩${NC}"
-        fi
-    else
-        echo -e "${YELLOW}警告: 无法自动安装 lz4，请手动安装以获得最佳性能${NC}"
-    fi
-else
-    echo -e "${GREEN}✓ lz4 已安装${NC}"
-fi
-
-# 检查pv工具（进度显示）
-if ! command -v pv &> /dev/null; then
-    echo -e "${YELLOW}未找到 pv 工具，将自动安装以显示传输进度${NC}"
-    
-    if command -v apt &> /dev/null; then
-        if sudo apt install -y pv >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ pv 安装成功${NC}"
-        else
-            echo -e "${YELLOW}警告: pv 安装失败${NC}"
-        fi
-    elif command -v yum &> /dev/null; then
-        if sudo yum install -y pv >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ pv 安装成功${NC}"
-        else
-            echo -e "${YELLOW}警告: pv 安装失败${NC}"
-        fi
-    elif command -v dnf &> /dev/null; then
-        if sudo dnf install -y pv >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ pv 安装成功${NC}"
-        else
-            echo -e "${YELLOW}警告: pv 安装失败${NC}"
-        fi
-    fi
-else
-    echo -e "${GREEN}✓ pv 已安装${NC}"
-fi
-
-echo -e "${GREEN}✓ 所有依赖检查和优化工具安装完成${NC}"
-
-# 导入配置处理函数
-source "$SYNC_SCRIPT"
-
-# 检查并安装远程服务器优化工具
-function check_and_install_remote_tools() {
-    local remote_host="$1"
-    local remote_port="$2"
-    local remote_os="$3"  # 配置的远程操作系统类型
-    
-    echo -e "${CYAN}检查远程服务器 $remote_host:$remote_port 的优化工具...${NC}"
-    
-    # 测试SSH连接
-    if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "$remote_host" -p "$remote_port" "echo 'SSH连接测试成功'" 2>/dev/null; then
-        echo -e "${YELLOW}警告: 无法连接到远程服务器，跳过工具检查${NC}"
-        return 1
-    fi
-    
-    # 使用配置的操作系统类型，而不是检测
-    local system=""
-    case "${remote_os,,}" in  # 转换为小写
-        ubuntu|debian)
-            system="debian"
+    case "$status_code" in
+        "SUCCESS"|"FOUND"|"INSTALLED")
+            echo "✓ $component: $message"
             ;;
-        centos|rhel|redhat)
-            system="rhel"
+        "ERROR"|"MISSING")
+            echo "✗ $component: $message"
             ;;
-        fedora)
-            system="fedora"
-            ;;
-        alpine)
-            system="alpine"
-            ;;
-        *)
-            echo -e "${YELLOW}警告: 未知的远程操作系统类型 '$remote_os'，默认使用 debian${NC}"
-            system="debian"
+        "WARNING")
+            echo "⚠ $component: $message"
             ;;
     esac
+}
+
+# 初始化远程日志环境 (通过install.sh统一管理)
+function init_remote_logging() {
+    local remote_host="$1"
+    local remote_port="$2"
     
-    echo -e "${GRAY}配置的远程系统: $remote_os -> $system${NC}"
+    echo "为远程服务器初始化日志环境..."
     
-    # 检查远程工具状态（不再检测系统类型）
-    local remote_check_result=$(ssh "$remote_host" -p "$remote_port" '
-        # 检查lz4
-        if command -v lz4 >/dev/null 2>&1; then
-            LZ4_STATUS="installed"
-        else
-            LZ4_STATUS="missing"
-        fi
-        
-        # 检查pv
-        if command -v pv >/dev/null 2>&1; then
-            PV_STATUS="installed"
-        else
-            PV_STATUS="missing"
-        fi
-        
-        echo "$LZ4_STATUS:$PV_STATUS"
-    ' 2>/dev/null)
-    
-    if [ -z "$remote_check_result" ]; then
-        echo -e "${YELLOW}警告: 无法检查远程工具状态${NC}"
+    if [ -z "$remote_host" ] || [ -z "$remote_port" ]; then
+        output_install_status "WARNING" "远程日志初始化"
+        echo "无远程服务器配置，跳过日志环境初始化"
         return 1
     fi
     
-    # 解析结果
+    # 检查远程连接
+    if ! ssh_exec "$remote_host" "$remote_port" "echo '连接测试'"; then
+        output_install_status "WARNING" "远程连接"
+        echo "无法连接到远程服务器，跳过日志环境初始化"
+        return 1
+    fi
+    
+    local remote_setup_script='#!/bin/bash
+# 远程服务器日志环境初始化脚本
+LOG_DIR=""
+
+# 确定远程日志目录
+if [ -w "/var/log" ] && [ "$EUID" -eq 0 ]; then
+    LOG_DIR="/var/log/sync-service"
+    mkdir -p "$LOG_DIR" 2>/dev/null
+else
+    LOG_DIR="$HOME/sync-logs"
+    mkdir -p "$LOG_DIR" 2>/dev/null || {
+        LOG_DIR="/tmp/sync-logs"
+        mkdir -p "$LOG_DIR"
+    }
+fi
+
+# 设置远程环境变量
+echo "export SYNC_LOG_DIR=\"$LOG_DIR\"" > ~/.sync-env
+
+# 创建远程日志查看脚本
+cat > "$LOG_DIR/view-logs.sh" << "EOF"
+#!/bin/bash
+LOG_DIR="$(dirname "$0")"
+case "${1:-sync}" in
+    "sync") tail -f "$LOG_DIR/sync.log" 2>/dev/null || echo "同步日志不存在" ;;
+    "error") tail -f "$LOG_DIR/error.log" 2>/dev/null || echo "错误日志不存在" ;;
+    "operations") tail -f "$LOG_DIR/operations.log" 2>/dev/null || echo "操作日志不存在" ;;
+    "recent") tail -20 "$LOG_DIR/sync.log" 2>/dev/null | grep -E "(OPERATION|ERROR)" || echo "无最近活动" ;;
+    *) echo "用法: $0 {sync|error|operations|recent}" ;;
+esac
+EOF
+
+chmod +x "$LOG_DIR/view-logs.sh"
+
+# 设置远程日志轮转
+if [ "$EUID" -eq 0 ]; then
+    cat > /etc/logrotate.d/sync-service << "EOF"
+/var/log/sync-service/*.log {
+    daily
+    missingok
+    rotate 7
+    compress
+    notifempty
+    create 644 root root
+}
+EOF
+else
+    (crontab -l 2>/dev/null; echo "0 2 * * * find $LOG_DIR -name \"*.log\" -size +10M -exec mv {} {}.old \\;") | crontab - 2>/dev/null
+fi
+
+echo "$LOG_DIR"
+'
+    
+    if echo "$remote_setup_script" | ssh_exec "$remote_host" "$remote_port" "cat > /tmp/init-remote-logging.sh && chmod +x /tmp/init-remote-logging.sh && /tmp/init-remote-logging.sh && rm -f /tmp/init-remote-logging.sh"; then
+        local remote_log_dir=$(ssh_exec "$remote_host" "$remote_port" "
+            if [ -d /var/log/sync-service ]; then
+                echo '/var/log/sync-service'
+            elif [ -d ~/sync-logs ]; then
+                echo '~/sync-logs'
+            elif [ -d /tmp/sync-logs ]; then
+                echo '/tmp/sync-logs'
+            fi
+        ")
+        
+        if [ -n "$remote_log_dir" ]; then
+            output_install_status "SUCCESS" "远程日志环境"
+            echo "远程日志位置: $remote_log_dir"
+            echo "查看远程日志: ssh $remote_host -p $remote_port '$remote_log_dir/view-logs.sh recent'"
+            
+            # 本地只保存远程日志信息，用于后续访问
+            local env_file="$SCRIPT_DIR/.sync-env"
+            echo "export REMOTE_LOG_DIR=\"$remote_log_dir\"" > "$env_file"
+            echo "export REMOTE_HOST=\"$remote_host\"" >> "$env_file"
+            echo "export REMOTE_PORT=\"$remote_port\"" >> "$env_file"
+            
+            return 0
+        fi
+    fi
+    
+    output_install_status "WARNING" "远程日志环境初始化失败"
+    echo "远程服务器将在首次运行时自动创建日志目录"
+    return 1
+}
+
+# 设置本地环境变量（不需要本地日志文件）
+function setup_local_environment() {
+    echo "设置本地环境变量..."
+    
+    # 本地客户端是轻量级调度器，不需要详细日志
+    local env_file="$SCRIPT_DIR/.sync-env"
+    # 环境变量文件已经在 init_remote_logging 中创建，这里不需要额外操作
+    
+    output_install_status "SUCCESS" "本地环境设置"
+    echo "本地客户端配置为轻量级调度器模式"
+}
+
+# 检查必要文件
+function check_required_files() {
+    echo "检查必要文件..."
+    
+    local required_files=("sync-files.sh" "sync-service.sh" "remote-sync-helper.sh")
+    local missing_files=()
+    
+    for file in "${required_files[@]}"; do
+        if [ -f "$file" ]; then
+            output_install_status "FOUND" "$file"
+        else
+            output_install_status "MISSING" "$file"
+            missing_files+=("$file")
+        fi
+    done
+    
+    if [ ${#missing_files[@]} -gt 0 ]; then
+        echo "错误: 缺少必要文件: ${missing_files[*]}"
+        return 1
+    fi
+    
+    output_install_status "SUCCESS" "所有必要文件"
+}
+
+# 检查系统依赖
+function check_system_dependencies() {
+    echo "检查系统依赖..."
+    
+    local required_tools=("git" "rsync" "ssh" "tar" "scp")
+    local missing_tools=()
+    
+    for tool in "${required_tools[@]}"; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            output_install_status "FOUND" "$tool"
+        else
+            output_install_status "MISSING" "$tool"
+            missing_tools+=("tool")
+        fi
+    done
+    
+    if [ ${#missing_tools[@]} -gt 0 ]; then
+        echo "错误: 缺少必要工具: ${missing_tools[*]}"
+        return 1
+    fi
+    
+    # 检查systemd
+    if systemctl --version >/dev/null 2>&1; then
+        output_install_status "FOUND" "systemd"
+    else
+        output_install_status "ERROR" "systemd"
+        echo "错误: 系统不支持 systemd"
+        return 1
+    fi
+    
+    output_install_status "SUCCESS" "基础依赖检查"
+}
+
+# 检查性能优化工具
+function check_performance_tools() {
+    echo "检查性能优化工具..."
+    
+    # 检查lz4
+    if ! command -v lz4 >/dev/null 2>&1; then
+        output_install_status "WARNING" "lz4"
+        echo "将自动安装以提升传输性能"
+        install_tool "lz4"
+    else
+        output_install_status "INSTALLED" "lz4"
+    fi
+    
+    # 检查pv
+    if ! command -v pv >/dev/null 2>&1; then
+        output_install_status "WARNING" "pv"
+        echo "将自动安装以显示传输进度"
+        install_tool "pv"
+    else
+        output_install_status "INSTALLED" "pv"
+    fi
+    
+    output_install_status "SUCCESS" "性能工具检查"
+}
+
+# 安装工具
+function install_tool() {
+    local tool="$1"
+    
+    if [ -f /etc/debian_version ]; then
+        apt-get update >/dev/null 2>&1 && apt-get install -y "$tool" >/dev/null 2>&1
+    elif [ -f /etc/redhat-release ]; then
+        yum install -y "$tool" >/dev/null 2>&1 || dnf install -y "$tool" >/dev/null 2>&1
+    elif [ -f /etc/fedora-release ]; then
+        dnf install -y "$tool" >/dev/null 2>&1
+    else
+        echo "警告: 无法自动安装 $tool，请手动安装"
+        return 1
+    fi
+    
+    if command -v "$tool" >/dev/null 2>&1; then
+        output_install_status "SUCCESS" "$tool 安装"
+    else
+        output_install_status "WARNING" "$tool 安装失败"
+    fi
+}
+
+# 检查远程工具
+function check_remote_tools() {
+    local remote_host="$1"
+    local remote_port="$2"
+    local remote_os="$3"
+    
+    echo "检查远程服务器工具..."
+    
+    if ! ssh_exec "$remote_host" "$remote_port" "echo '连接测试'"; then
+        output_install_status "WARNING" "远程连接"
+        echo "无法连接到远程服务器，跳过工具检查"
+        return 1
+    fi
+    
+    local remote_check_result=$(ssh_exec "$remote_host" "$remote_port" '
+        lz4_status="missing"; command -v lz4 >/dev/null 2>&1 && lz4_status="installed"
+        pv_status="missing"; command -v pv >/dev/null 2>&1 && pv_status="installed"
+        echo "$lz4_status:$pv_status"
+    ')
+    
+    if [ -z "$remote_check_result" ]; then
+        output_install_status "WARNING" "远程工具检查"
+        return 1
+    fi
+    
     IFS=':' read -r lz4_status pv_status <<< "$remote_check_result"
     
-    echo -e "${GRAY}远程工具状态: lz4: $lz4_status, pv: $pv_status${NC}"
+    local tools_to_install=()
+    [ "$lz4_status" = "missing" ] && tools_to_install+=("lz4")
+    [ "$pv_status" = "missing" ] && tools_to_install+=("pv")
     
-    # 安装缺失的工具
-    local install_commands=""
-    local tools_to_install=""
-    
-    if [ "$lz4_status" = "missing" ]; then
-        tools_to_install+="lz4 "
-    fi
-    
-    if [ "$pv_status" = "missing" ]; then
-        tools_to_install+="pv "
-    fi
-    
-    if [ -n "$tools_to_install" ]; then
-        echo -e "${YELLOW}远程服务器缺少优化工具: $tools_to_install${NC}"
-        echo -e "${CYAN}正在安装远程优化工具...${NC}"
+    if [ ${#tools_to_install[@]} -gt 0 ]; then
+        echo "远程服务器缺少工具: ${tools_to_install[*]}"
+        echo "正在安装远程工具..."
         
-        case "$system" in
-            "debian")
-                install_commands="sudo apt update >/dev/null 2>&1 && sudo apt install -y $tools_to_install >/dev/null 2>&1"
+        local install_commands=""
+        case "${remote_os,,}" in
+            ubuntu|debian)
+                install_commands="apt-get update >/dev/null 2>&1 && apt-get install -y ${tools_to_install[*]} >/dev/null 2>&1"
                 ;;
-            "rhel")
-                install_commands="sudo yum install -y $tools_to_install >/dev/null 2>&1"
+            centos|rhel|redhat)
+                install_commands="yum install -y ${tools_to_install[*]} >/dev/null 2>&1"
                 ;;
-            "fedora")
-                install_commands="sudo dnf install -y $tools_to_install >/dev/null 2>&1"
-                ;;
-            "alpine")
-                install_commands="sudo apk update >/dev/null 2>&1 && sudo apk add $tools_to_install >/dev/null 2>&1"
+            fedora)
+                install_commands="dnf install -y ${tools_to_install[*]} >/dev/null 2>&1"
                 ;;
             *)
-                echo -e "${YELLOW}警告: 未知系统类型，无法自动安装工具${NC}"
+                output_install_status "WARNING" "未知系统类型"
                 return 1
                 ;;
         esac
         
-        # 执行安装命令
-        if ssh "$remote_host" -p "$remote_port" "$install_commands" 2>/dev/null; then
-            echo -e "${GREEN}✓ 远程优化工具安装成功${NC}"
+        if ssh_exec "$remote_host" "$remote_port" "$install_commands"; then
+            output_install_status "SUCCESS" "远程工具安装"
         else
-            echo -e "${YELLOW}警告: 远程工具安装失败，可能需要手动安装或权限不足${NC}"
-            echo -e "${GRAY}提示: 在远程服务器手动执行: $install_commands${NC}"
+            output_install_status "WARNING" "远程工具安装失败"
+            echo "提示: 在远程服务器手动执行: $install_commands"
         fi
     else
-        echo -e "${GREEN}✓ 远程服务器优化工具已就绪${NC}"
+        output_install_status "SUCCESS" "远程工具"
     fi
 }
 
-# 上传远程脚本函数
+# 上传远程脚本
 function upload_remote_script() {
     local remote_host="$1"
     local remote_port="$2"
+    
+    echo "上传远程助手脚本..."
+    
+    if [ ! -f "$REMOTE_HELPER_SCRIPT" ]; then
+        output_install_status "ERROR" "远程助手脚本"
+        echo "找不到 $REMOTE_HELPER_SCRIPT"
+        return 1
+    fi
+    
+    if ! ssh_exec "$remote_host" "$remote_port" "echo '连接测试'"; then
+        output_install_status "ERROR" "远程连接"
+        echo "无法连接到远程服务器"
+        echo "请检查:"
+        echo "  1. 服务器地址和端口是否正确"
+        echo "  2. SSH密钥是否已配置"
+        echo "  3. 网络连接是否正常"
+        return 1
+    fi
+    
     local remote_script_path="/tmp/remote-sync-helper.sh"
     
-    echo -e "${CYAN}上传远程助手脚本到 $remote_host:$remote_port...${NC}"
-    
-    # 检查本地远程脚本是否存在
-    if [ ! -f "$REMOTE_HELPER_SCRIPT" ]; then
-        echo -e "${RED}错误: 找不到远程助手脚本 $REMOTE_HELPER_SCRIPT${NC}"
-        return 1
-    fi
-    
-    # 测试SSH连接
-    if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "$remote_host" -p "$remote_port" "echo 'SSH连接测试成功'" 2>/dev/null; then
-        echo -e "${RED}错误: 无法连接到远程服务器 $remote_host:$remote_port${NC}"
-        echo -e "${YELLOW}请检查:${NC}"
-        echo -e "${WHITE}  1. 服务器地址和端口是否正确${NC}"
-        echo -e "${WHITE}  2. SSH密钥是否已配置${NC}"
-        echo -e "${WHITE}  3. 网络连接是否正常${NC}"
-        return 1
-    fi
-    
-    # 上传脚本
     if scp -P "$remote_port" "$REMOTE_HELPER_SCRIPT" "$remote_host:$remote_script_path" 2>/dev/null; then
-        # 设置执行权限
-        if ssh "$remote_host" -p "$remote_port" "chmod +x $remote_script_path" 2>/dev/null; then
-            echo -e "${GREEN}✓ 远程助手脚本上传成功${NC}"
+        output_install_status "SUCCESS" "脚本上传"
+        
+        if ssh_exec "$remote_host" "$remote_port" "chmod +x $remote_script_path"; then
+            output_install_status "SUCCESS" "脚本权限设置"
             return 0
         else
-            echo -e "${RED}错误: 无法设置远程脚本执行权限${NC}"
+            output_install_status "ERROR" "脚本权限设置"
             return 1
         fi
     else
-        echo -e "${RED}错误: 远程脚本上传失败${NC}"
+        output_install_status "ERROR" "脚本上传失败"
         return 1
     fi
 }
 
-# 安装文件同步服务
+# 安装服务
 function install_file_sync_service() {
-    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
-    echo "[$timestamp] 开始安装文件同步服务..." >> "$SCRIPT_DIR/service.log"
+    echo "开始安装文件同步服务..."
     
     # 步骤1: 加载配置
     echo ""
-    echo -e "${CYAN}步骤1: 加载配置文件${NC}"
-    
-    # 使用导入的配置函数
+    echo "步骤1: 加载配置文件"
     if ! load_cached_config; then
         load_config
     fi
     
-    # 步骤2: 检查远程服务器优化工具
+    # 步骤2: 初始化远程日志环境
     echo ""
-    echo -e "${CYAN}步骤2: 检查远程服务器优化工具${NC}"
-    
+    echo "步骤2: 初始化远程日志环境"
     if [ -n "$REMOTE_HOST" ]; then
-        check_and_install_remote_tools "$REMOTE_HOST" "$REMOTE_PORT" "$REMOTE_OS"
+        init_remote_logging "$REMOTE_HOST" "$REMOTE_PORT"
     else
-        echo -e "${YELLOW}跳过远程工具检查（无有效配置）${NC}"
+        echo "跳过远程日志初始化（无有效配置）"
     fi
     
-    # 步骤3: 上传远程助手脚本
+    # 步骤3: 设置本地环境
     echo ""
-    echo -e "${CYAN}步骤3: 上传远程助手脚本${NC}"
+    echo "步骤3: 设置本地环境"
+    setup_local_environment
     
+    # 步骤4: 检查远程工具
+    echo ""
+    echo "步骤4: 检查远程服务器工具"
+    if [ -n "$REMOTE_HOST" ]; then
+        check_remote_tools "$REMOTE_HOST" "$REMOTE_PORT" "$REMOTE_OS"
+    else
+        echo "跳过远程工具检查（无有效配置）"
+    fi
+    
+    # 步骤5: 上传远程脚本
+    echo ""
+    echo "步骤5: 上传远程助手脚本"
     if [ -n "$REMOTE_HOST" ]; then
         if upload_remote_script "$REMOTE_HOST" "$REMOTE_PORT"; then
-            echo -e "${GREEN}✓ 远程脚本上传完成${NC}"
+            output_install_status "SUCCESS" "远程脚本上传"
         else
-            echo -e "${YELLOW}警告: 远程脚本上传失败，服务仍可正常安装${NC}"
-            echo -e "${YELLOW}首次运行时会自动上传远程脚本${NC}"
+            output_install_status "WARNING" "远程脚本上传失败"
+            echo "服务仍可正常安装，首次运行时会自动上传远程脚本"
         fi
     else
-        echo -e "${YELLOW}跳过远程脚本上传（无有效配置）${NC}"
+        echo "跳过远程脚本上传（无有效配置）"
     fi
     
-    # 步骤4: 创建systemd服务
+    # 步骤6: 创建systemd服务
     echo ""
-    echo -e "${CYAN}步骤4: 创建systemd服务${NC}"
+    echo "步骤6: 创建systemd服务"
     
-    # 服务配置
     local SERVICE_NAME="file-sync-service"
     local SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-    local LOG_FILE="$SCRIPT_DIR/service.log"
     
-    # 创建systemd服务文件
+    # 创建服务文件，本地服务主要负责调度，详细日志在远程
     cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=File Sync Service
+Description=文件同步服务（客户端调度器）
 After=network.target
 
 [Service]
@@ -376,91 +428,119 @@ Type=simple
 User=$SUDO_USER
 Group=$SUDO_USER
 WorkingDirectory=$SCRIPT_DIR
-ExecStart=$SYNC_SCRIPT
+ExecStartPre=/bin/bash -c 'source $SCRIPT_DIR/.sync-env 2>/dev/null || true'
+ExecStart=/bin/bash -c 'source $SCRIPT_DIR/.sync-env 2>/dev/null; $SCRIPT_DIR/sync-files.sh'
 Restart=always
-RestartSec=10
-StandardOutput=append:$LOG_FILE
-StandardError=append:$LOG_FILE
+RestartSec=30
+StandardOutput=null
+StandardError=journal
+KillMode=process
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target
 EOF
     
-    # 设置脚本执行权限
-    chmod +x "$SYNC_SCRIPT"
+    output_install_status "SUCCESS" "systemd服务创建"
     
-    # 重新加载systemd配置
+    # 显示配置预览
+    echo ""
+    echo "当前配置预览:"
+    head -5 sync.yaml 2>/dev/null | while read line; do
+        echo "  $line"
+    done
+    
+    echo ""
+    echo "开始安装服务..."
+    
+    if [ "$EUID" -ne 0 ]; then
+        echo "需要sudo权限来安装系统服务"
+        echo "请输入sudo密码..."
+    fi
+    
+    # 设置权限并启用服务
+    chmod +x "$SCRIPT_DIR/sync-files.sh"
+    chmod +x "$SCRIPT_DIR/sync-service.sh"
     systemctl daemon-reload
-    
-    # 启用服务开机自启
     systemctl enable "$SERVICE_NAME"
     
-    echo "[$timestamp] 服务安装成功！已创建开机自启动服务。" >> "$LOG_FILE"
-    echo "[$timestamp] 服务名称: $SERVICE_NAME" >> "$LOG_FILE"
-    echo "[$timestamp] 服务文件: $SERVICE_FILE" >> "$LOG_FILE"
+    echo ""
+    echo "启动服务..."
+    systemctl start "$SERVICE_NAME"
     
-    echo -e "${GREEN}✓ systemd服务创建完成${NC}"
-    return 0
+    echo ""
+    echo "检查服务状态..."
+    sleep 2
+    
+    echo ""
+    echo "=== 安装完成 ==="
+    echo "服务已安装并启动，将在下次开机时自动启动"
+    echo "客户端运行在静默模式，详细日志记录在远程服务器"
+    echo ""
+    echo "本地服务管理命令:"
+    echo "  查看状态: ./sync-service.sh status"
+    echo "  停止服务: ./sync-service.sh stop"
+    echo "  启动服务: ./sync-service.sh start"
+    echo "  重启服务: ./sync-service.sh restart"
+    echo "  查看管理日志: ./sync-service.sh logs"
+    echo "  实时管理日志: ./sync-service.sh logs-f"
+    echo "  卸载服务: sudo ./sync-service.sh uninstall"
+    echo ""
+    echo "远程日志查看命令:"
+    
+    if [ -n "$REMOTE_HOST" ] && [ -n "$REMOTE_PORT" ]; then
+        local remote_log_dir=$(ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "
+            if [ -d /var/log/sync-service ]; then
+                echo '/var/log/sync-service'
+            elif [ -d ~/sync-logs ]; then
+                echo '~/sync-logs'
+            fi
+        " 2>/dev/null)
+        
+        if [ -n "$remote_log_dir" ]; then
+            echo "  查看同步摘要: ssh $REMOTE_HOST -p $REMOTE_PORT '$remote_log_dir/view-logs.sh recent'"
+            echo "  实时同步日志: ssh $REMOTE_HOST -p $REMOTE_PORT '$remote_log_dir/view-logs.sh sync'"
+            echo "  实时错误日志: ssh $REMOTE_HOST -p $REMOTE_PORT '$remote_log_dir/view-logs.sh error'"
+            echo "  操作记录日志: ssh $REMOTE_HOST -p $REMOTE_PORT '$remote_log_dir/view-logs.sh operations'"
+        else
+            echo "  远程日志目录未检测到，将在首次同步时自动创建"
+        fi
+    else
+        echo "  无远程服务器配置"
+    fi
+    
+    echo ""
+    echo "日志说明:"
+    echo "  - 客户端: 仅记录服务管理日志"
+    echo "  - 远程服务器: 记录详细的同步操作日志"
+    echo "  - 错误处理: 自动重试和故障恢复"
 }
 
-# 显示当前配置
-echo ""
-echo -e "${CYAN}当前配置预览:${NC}"
-head -20 "$SYNC_SCRIPT" | grep -E '^[A-Z_]+=.*' | while read line; do
-    echo -e "${WHITE}  $line${NC}"
-done
-
-echo ""
-echo -e "${WHITE}确认安装并设置开机自启? (Y/N): ${NC}"
-read -r confirm
-
-if [[ "$confirm" =~ ^[Yy]$ ]]; then
+# 主执行逻辑
+function main() {
+    echo "=== 文件同步服务安装程序 ==="
     echo ""
-    echo -e "${GREEN}开始安装服务...${NC}"
     
-    # 检查是否需要sudo权限
+    # 检查sudo权限
     if [ "$EUID" -ne 0 ]; then
-        echo -e "${YELLOW}需要sudo权限来安装系统服务${NC}"
-        echo -e "${YELLOW}请输入sudo密码...${NC}"
-        
-        # 使用sudo重新运行当前脚本
-        exec sudo "$0" "$@"
-    fi
-    
-    # 以下代码以root权限运行
-    install_file_sync_service
-    
-    if [ $? -eq 0 ]; then
-        echo ""
-        echo -e "${GREEN}启动服务...${NC}"
-        systemctl start file-sync-service
-        
-        echo ""
-        echo -e "${GREEN}检查服务状态...${NC}"
-        systemctl status file-sync-service --no-pager -l
-        
-        echo ""
-        echo -e "${GREEN}=== 安装完成 ===${NC}"
-        echo -e "${WHITE}服务已安装并启动，将在下次开机时自动启动${NC}"
-        echo ""
-        echo -e "${CYAN}常用命令:${NC}"
-        echo -e "${WHITE}  查看状态: ./sync-service.sh status${NC}"
-        echo -e "${WHITE}  停止服务: ./sync-service.sh stop${NC}"
-        echo -e "${WHITE}  启动服务: ./sync-service.sh start${NC}"
-        echo -e "${WHITE}  重启服务: ./sync-service.sh restart${NC}"
-        echo -e "${WHITE}  查看日志: ./sync-service.sh logs${NC}"
-        echo -e "${WHITE}  实时日志: ./sync-service.sh logs-f${NC}"
-        echo -e "${WHITE}  卸载服务: sudo ./sync-service.sh uninstall${NC}"
-        echo ""
-        echo -e "\033[0;37m日志文件: service.log\033[0m"
-    else
-        echo -e "${RED}安装失败${NC}"
+        echo "请使用sudo权限运行此脚本"
+        echo "使用: sudo $0"
         exit 1
     fi
-else
-    echo -e "${YELLOW}安装已取消${NC}"
-fi
+    
+    # 基础检查
+    check_required_files || exit 1
+    echo ""
+    
+    check_system_dependencies || exit 1
+    echo ""
+    
+    check_performance_tools
+    echo ""
+    
+    # 安装服务
+    install_file_sync_service
+}
 
-echo ""
-echo -e "${WHITE}按任意键退出...${NC}"
-read -n 1 -s 
+# 执行主函数
+main "$@" 

@@ -1,5 +1,19 @@
 #!/bin/bash
 
+# 加载环境变量
+if [ -f "$(dirname "$0")/.sync-env" ]; then
+    source "$(dirname "$0")/.sync-env"
+fi
+
+# 本地客户端不需要详细日志，只在远程服务器记录
+
+# 导入YAML解析库
+if ! command -v yq >/dev/null 2>&1; then
+    echo "错误: 需要安装 yq 工具来解析YAML配置"
+    echo "安装命令: sudo apt install yq 或 sudo yum install yq"
+    exit 1
+fi
+
 # 防止重复加载配置函数
 if [ -n "$SYNC_CONFIG_LOADED" ]; then
     return 0 2>/dev/null || true
@@ -9,7 +23,7 @@ SYNC_CONFIG_LOADED=true
 # 配置文件路径
 CONFIG_FILE="/mnt/d/sync.yaml"
 
-# 默认配置 (当YAML文件不存在或解析失败时使用)
+# 默认配置
 DEFAULT_REMOTE_HOST="34.68.158.244"
 DEFAULT_REMOTE_PORT="22"
 DEFAULT_REMOTE_DIR="/root/work"
@@ -17,19 +31,11 @@ DEFAULT_REMOTE_OS="ubuntu"
 DEFAULT_REFRESH_INTERVAL=60
 DEFAULT_LOCAL_DIRS=()
 DEFAULT_EXCLUDE_PATTERNS=(
-    '.git'
-    '.gitignore'
-    '.idea'
-    '.vscode'
-    '.log'
-    '.vs'
-    '__pycache__'
-    'build'
-    'target'
-    'node_modules'
+    '.git' '.gitignore' '.idea' '.vscode' '.log' '.vs'
+    '__pycache__' 'build' 'target' 'node_modules'
 )
 
-# 当前配置变量 (从YAML加载或使用默认值)
+# 当前配置变量
 REMOTE_HOST=""
 REMOTE_PORT=""
 REMOTE_DIR=""
@@ -53,18 +59,32 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-WHITE='\033[1;37m'
 GRAY='\033[0;37m'
-DARK_GRAY='\033[1;30m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# 全局变量：循环计数器和错误统计
+# 全局变量
 LOOP_COUNTER=0
 ERROR_COUNTER=0
 MAX_ERRORS=10
-MAX_LOOPS=86400  # 24小时最大循环次数（按秒计算）
+MAX_LOOPS=86400
 
+# 状态码定义
+declare -A SYNC_STATUS=(
+    ["SUCCESS"]="成功"
+    ["ERROR"]="错误"
+    ["WARNING"]="警告"
+    ["SKIPPED"]="跳过"
+    ["RETRY"]="重试"
+    ["TIMEOUT"]="超时"
+    ["NETWORK_ERROR"]="网络错误"
+    ["AUTH_ERROR"]="认证错误"
+    ["SPACE_ERROR"]="空间不足"
+    ["PERMISSION_ERROR"]="权限错误"
+)
+
+# 统一的排除参数生成函数
 function get_exclude_args() {
+    local format="${1:-rsync}"  # rsync|tar
     local exclude_args=""
     for pattern in "${EXCLUDE_PATTERNS[@]}"; do
         exclude_args+="--exclude='$pattern' "
@@ -72,141 +92,98 @@ function get_exclude_args() {
     echo "$exclude_args"
 }
 
-function get_tar_exclude_args() {
-    local exclude_args=""
-    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
-        exclude_args+="--exclude='$pattern' "
-    done
-    echo "$exclude_args"
+# 统一的SSH执行函数
+function ssh_exec() {
+    local host="$1"
+    local port="$2"
+    local command="$3"
+    local timeout="${4:-10}"
+    
+    ssh -o ConnectTimeout="$timeout" -o BatchMode=yes "$host" -p "$port" "$command" 2>/dev/null
+}
+
+# 统一的状态输出函数
+function output_status() {
+    local status_code="$1"
+    local component="$2"
+    local details="$3"
+    local message="${SYNC_STATUS[$status_code]:-$status_code}"
+    
+    case "$status_code" in
+        "SUCCESS")
+            echo "[$component] $message${details:+: $details}"
+            ;;
+        "ERROR"|"TIMEOUT"|"NETWORK_ERROR"|"AUTH_ERROR"|"SPACE_ERROR"|"PERMISSION_ERROR")
+            echo "[$component] $message${details:+: $details}" >&2
+            ;;
+        "WARNING"|"SKIPPED"|"RETRY")
+            echo "[$component] $message${details:+: $details}"
+            ;;
+    esac
 }
 
 function load_config() {
-    # 检查配置文件是否存在
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}Configuration file not found: $CONFIG_FILE${NC}"
-        echo -e "${YELLOW}Using default configuration...${NC}"
+        output_status "WARNING" "CONFIG" 
+        echo "配置文件未找到，使用默认配置"
         load_default_config
         return
     fi
     
-    # 获取配置文件的时间戳
     local current_timestamp=$(stat -c %Y "$CONFIG_FILE" 2>/dev/null)
     
-    # 检查是否有缓存且时间戳一致
     if [ -f "$CONFIG_CACHE_FILE" ] && [ "$CONFIG_TIMESTAMP" = "$current_timestamp" ] && [ ${#LOCAL_DIRS[@]} -gt 0 ]; then
-        echo -e "${GRAY}Using cached configuration (timestamp: $current_timestamp)${NC}"
-        return
+        return  # 使用缓存
     fi
     
-    # 静默加载配置
-    
-    # 先加载默认配置作为基础
     load_default_config
-    
-    # 清空数组配置
     LOCAL_DIRS=()
     EXCLUDE_PATTERNS=()
     
-    # YAML解析状态变量
-    local in_directories_section=false
-    local in_exclude_patterns_section=false
-    local in_remote_section=false
+    # 简化的YAML解析
+    local in_directories=false
+    local in_exclude=false
+    local in_remote=false
     
     while IFS= read -r line; do
-        # 去除前后空格
         line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        
-        # 跳过空行和注释
         [[ -z "$line" || "$line" =~ ^# ]] && continue
         
-        # 检查顶级配置项
-        if [[ "$line" =~ ^remote: ]]; then
-            in_remote_section=true
-            in_directories_section=false
-            in_exclude_patterns_section=false
-            continue
-        elif [[ "$line" =~ ^directories: ]]; then
-            in_directories_section=true
-            in_remote_section=false
-            in_exclude_patterns_section=false
-            continue
-        elif [[ "$line" =~ ^exclude_patterns: ]]; then
-            in_exclude_patterns_section=true
-            in_directories_section=false
-            in_remote_section=false
-            continue
-        elif [[ "$line" =~ ^refresh_interval:[[:space:]]*(.+)$ ]]; then
-            local interval_value="${BASH_REMATCH[1]}"
-            # 去除引号并提取数字
-            interval_value=$(echo "$interval_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
-            REFRESH_INTERVAL="$interval_value"
-            echo -e "${GRAY}  Set refresh_interval: $REFRESH_INTERVAL${NC}"
-            in_directories_section=false
-            in_remote_section=false
-            in_exclude_patterns_section=false
-            continue
-        elif [[ "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*: ]]; then
-            # 其他顶级键，重置所有section标志
-            in_directories_section=false
-            in_remote_section=false
-            in_exclude_patterns_section=false
-            continue
-        fi
+        case "$line" in
+            "remote:")
+                in_remote=true; in_directories=false; in_exclude=false ;;
+            "directories:")
+                in_directories=true; in_remote=false; in_exclude=false ;;
+            "exclude_patterns:")
+                in_exclude=true; in_remote=false; in_directories=false ;;
+            "refresh_interval:"*)
+                REFRESH_INTERVAL=$(echo "$line" | sed 's/.*:[[:space:]]*//;s/["'\'']*//g')
+                in_remote=false; in_directories=false; in_exclude=false ;;
+            *":"*)
+                in_remote=false; in_directories=false; in_exclude=false ;;
+        esac
         
-        # 处理remote部分的配置
-        if [ "$in_remote_section" = true ]; then
-            if [[ "$line" =~ ^host:[[:space:]]*(.+)$ ]]; then
-                # 提取值并去除引号
-                local host_value="${BASH_REMATCH[1]}"
-                # 去除双引号和单引号
-                host_value=$(echo "$host_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
-                REMOTE_HOST="$host_value"
-            elif [[ "$line" =~ ^port:[[:space:]]*(.+)$ ]]; then
-                local port_value="${BASH_REMATCH[1]}"
-                # 去除引号并提取数字
-                port_value=$(echo "$port_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
-                REMOTE_PORT="$port_value"
-            elif [[ "$line" =~ ^dir:[[:space:]]*(.+)$ ]]; then
-                local dir_value="${BASH_REMATCH[1]}"
-                # 去除引号
-                dir_value=$(echo "$dir_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
-                REMOTE_DIR="$dir_value"
-            elif [[ "$line" =~ ^os:[[:space:]]*(.+)$ ]]; then
-                local os_value="${BASH_REMATCH[1]}"
-                # 去除引号
-                os_value=$(echo "$os_value" | sed 's/^["'\'']*//;s/["'\'']*$//')
-                REMOTE_OS="$os_value"
-            fi
+        if [ "$in_remote" = true ] && [[ "$line" =~ ^[a-z]+:[[:space:]]*.+ ]]; then
+            local key=$(echo "$line" | cut -d: -f1)
+            local value=$(echo "$line" | sed 's/.*:[[:space:]]*//;s/["'\'']*//g')
+            case "$key" in
+                "host") REMOTE_HOST="$value" ;;
+                "port") REMOTE_PORT="$value" ;;
+                "dir") REMOTE_DIR="$value" ;;
+                "os") REMOTE_OS="$value" ;;
+            esac
+        elif [ "$in_directories" = true ] && [[ "$line" =~ ^-[[:space:]]+ ]]; then
+            local dir_path=$(echo "$line" | sed 's/^-[[:space:]]*//;s/["'\'']*//g')
+            [ -n "$dir_path" ] && LOCAL_DIRS+=("$dir_path")
+        elif [ "$in_exclude" = true ] && [[ "$line" =~ ^-[[:space:]]+ ]]; then
+            local pattern=$(echo "$line" | sed 's/^-[[:space:]]*//;s/["'\'']*//g')
+            [ -n "$pattern" ] && EXCLUDE_PATTERNS+=("$pattern")
         fi
-        
-        # 处理directories部分
-        if [ "$in_directories_section" = true ] && [[ "$line" =~ ^-[[:space:]]+ ]]; then
-            local dir_path=$(echo "$line" | sed 's/^-[[:space:]]*//' | sed 's/^["'\'']//' | sed 's/["'\'']*$//')
-            if [ -n "$dir_path" ]; then
-                LOCAL_DIRS+=("$dir_path")
-            fi
-        fi
-        
-        # 处理exclude_patterns部分
-        if [ "$in_exclude_patterns_section" = true ] && [[ "$line" =~ ^-[[:space:]]+ ]]; then
-            local pattern=$(echo "$line" | sed 's/^-[[:space:]]*//' | sed 's/^["'\'']//' | sed 's/["'\'']*$//')
-            if [ -n "$pattern" ]; then
-                EXCLUDE_PATTERNS+=("$pattern")
-            fi
-        fi
-        
     done < "$CONFIG_FILE"
     
-    # 更新时间戳缓存
     CONFIG_TIMESTAMP="$current_timestamp"
-    
-    # 保存到缓存文件
     save_config_cache
-    
-    # 验证配置
     validate_config
-    
-    # 配置加载完成（静默）
 }
 
 function load_default_config() {
@@ -220,21 +197,17 @@ function load_default_config() {
 }
 
 function validate_config() {
-    # 如果关键配置为空，使用默认值
     [ -z "$REMOTE_HOST" ] && REMOTE_HOST="$DEFAULT_REMOTE_HOST"
     [ -z "$REMOTE_PORT" ] && REMOTE_PORT="$DEFAULT_REMOTE_PORT"
     [ -z "$REMOTE_DIR" ] && REMOTE_DIR="$DEFAULT_REMOTE_DIR"
     [ -z "$REMOTE_OS" ] && REMOTE_OS="$DEFAULT_REMOTE_OS"
     [ -z "$REFRESH_INTERVAL" ] && REFRESH_INTERVAL="$DEFAULT_REFRESH_INTERVAL"
     
-    # 如果数组为空，使用默认值
     if [ ${#LOCAL_DIRS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}No directories found in configuration, using defaults...${NC}"
         LOCAL_DIRS=("${DEFAULT_LOCAL_DIRS[@]}")
     fi
     
     if [ ${#EXCLUDE_PATTERNS[@]} -eq 0 ]; then
-        echo -e "${YELLOW}No exclude patterns found in configuration, using defaults...${NC}"
         EXCLUDE_PATTERNS=("${DEFAULT_EXCLUDE_PATTERNS[@]}")
     fi
 }
@@ -256,91 +229,52 @@ function save_config_cache() {
     } > "$CONFIG_CACHE_FILE"
 }
 
-function ensure_remote_script() {
-    # 如果已经确认存在，跳过检查
-    if [ "$REMOTE_SCRIPT_UPLOADED" = true ]; then
-        return 0
-    fi
+function load_cached_config() {
+    [ ! -f "$CONFIG_CACHE_FILE" ] && return 1
     
-    # 检查远程脚本是否存在
-    if ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "[ -x $REMOTE_SCRIPT_PATH ]" 2>/dev/null; then
+    local cached_dirs=()
+    local cached_patterns=()
+    local cached_timestamp=""
+    
+    while IFS= read -r line; do
+        case "$line" in
+            CONFIG_TIMESTAMP=*) cached_timestamp="${line#CONFIG_TIMESTAMP=}" ;;
+            REMOTE_HOST=*) REMOTE_HOST="${line#REMOTE_HOST=}" ;;
+            REMOTE_PORT=*) REMOTE_PORT="${line#REMOTE_PORT=}" ;;
+            REMOTE_DIR=*) REMOTE_DIR="${line#REMOTE_DIR=}" ;;
+            REMOTE_OS=*) REMOTE_OS="${line#REMOTE_OS=}" ;;
+            REFRESH_INTERVAL=*) REFRESH_INTERVAL="${line#REFRESH_INTERVAL=}" ;;
+            LOCAL_DIR=*) cached_dirs+=("${line#LOCAL_DIR=}") ;;
+            EXCLUDE_PATTERN=*) cached_patterns+=("${line#EXCLUDE_PATTERN=}") ;;
+        esac
+    done < "$CONFIG_CACHE_FILE"
+    
+    if [ -f "$CONFIG_FILE" ]; then
+        local current_timestamp=$(stat -c %Y "$CONFIG_FILE" 2>/dev/null)
+        if [ "$cached_timestamp" = "$current_timestamp" ] && [ ${#cached_dirs[@]} -gt 0 ]; then
+            LOCAL_DIRS=("${cached_dirs[@]}")
+            EXCLUDE_PATTERNS=("${cached_patterns[@]}")
+            CONFIG_TIMESTAMP="$cached_timestamp"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+function ensure_remote_script() {
+    [ "$REMOTE_SCRIPT_UPLOADED" = true ] && return 0
+    
+    if ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "[ -x $REMOTE_SCRIPT_PATH ]"; then
         REMOTE_SCRIPT_UPLOADED=true
         return 0
     fi
     
-    # 远程脚本不存在，尝试上传
-    if [ ! -f "$LOCAL_SCRIPT_PATH" ]; then
-        echo -e "${RED}Remote helper script not found: $LOCAL_SCRIPT_PATH${NC}"
-        return 1
-    fi
+    [ ! -f "$LOCAL_SCRIPT_PATH" ] && return 1
     
-    # 上传脚本到远程服务器（静默）
-    scp -P "$REMOTE_PORT" "$LOCAL_SCRIPT_PATH" "$REMOTE_HOST:$REMOTE_SCRIPT_PATH" 2>/dev/null
-    
-    if [ $? -eq 0 ]; then
-        ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "chmod +x $REMOTE_SCRIPT_PATH" 2>/dev/null
-        if [ $? -eq 0 ]; then
+    if scp -P "$REMOTE_PORT" "$LOCAL_SCRIPT_PATH" "$REMOTE_HOST:$REMOTE_SCRIPT_PATH" 2>/dev/null; then
+        if ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "chmod +x $REMOTE_SCRIPT_PATH"; then
             REMOTE_SCRIPT_UPLOADED=true
             return 0
-        else
-            echo -e "${RED}Failed to set script permissions${NC}"
-            return 1
-        fi
-    else
-        echo -e "${RED}Failed to upload remote script${NC}"
-        return 1
-    fi
-}
-
-function load_cached_config() {
-    # 如果缓存文件存在，尝试加载缓存
-    if [ -f "$CONFIG_CACHE_FILE" ]; then
-        local cached_dirs=()
-        local cached_patterns=()
-        local cached_timestamp=""
-        local cached_host=""
-        local cached_port=""
-        local cached_dir=""
-        local cached_os=""
-        local cached_interval=""
-        
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^CONFIG_TIMESTAMP= ]]; then
-                cached_timestamp="${line#CONFIG_TIMESTAMP=}"
-            elif [[ "$line" =~ ^REMOTE_HOST= ]]; then
-                cached_host="${line#REMOTE_HOST=}"
-            elif [[ "$line" =~ ^REMOTE_PORT= ]]; then
-                cached_port="${line#REMOTE_PORT=}"
-            elif [[ "$line" =~ ^REMOTE_DIR= ]]; then
-                cached_dir="${line#REMOTE_DIR=}"
-            elif [[ "$line" =~ ^REMOTE_OS= ]]; then
-                cached_os="${line#REMOTE_OS=}"
-            elif [[ "$line" =~ ^REFRESH_INTERVAL= ]]; then
-                cached_interval="${line#REFRESH_INTERVAL=}"
-            elif [[ "$line" =~ ^LOCAL_DIR= ]]; then
-                cached_dirs+=("${line#LOCAL_DIR=}")
-            elif [[ "$line" =~ ^EXCLUDE_PATTERN= ]]; then
-                cached_patterns+=("${line#EXCLUDE_PATTERN=}")
-            fi
-        done < "$CONFIG_CACHE_FILE"
-        
-        # 检查配置文件是否存在且时间戳一致
-        if [ -f "$CONFIG_FILE" ]; then
-            local current_timestamp=$(stat -c %Y "$CONFIG_FILE" 2>/dev/null)
-            if [ "$cached_timestamp" = "$current_timestamp" ] && [ ${#cached_dirs[@]} -gt 0 ]; then
-                # 加载所有缓存的配置
-                REMOTE_HOST="$cached_host"
-                REMOTE_PORT="$cached_port"
-                REMOTE_DIR="$cached_dir"
-                REMOTE_OS="$cached_os"
-                REFRESH_INTERVAL="$cached_interval"
-                LOCAL_DIRS=("${cached_dirs[@]}")
-                EXCLUDE_PATTERNS=("${cached_patterns[@]}")
-                CONFIG_TIMESTAMP="$cached_timestamp"
-                
-                # 缓存配置加载完成（静默）
-                return 0
-            fi
         fi
     fi
     return 1
@@ -349,218 +283,101 @@ function load_cached_config() {
 function update_remote_repository() {
     local remote_target_dir="$1"
     local dir_name="$2"
-    local files_to_keep="$3"  # 要保留的文件列表
-    local local_hash="$4"     # 本地当前哈希值
-    local local_branch="$5"   # 本地当前分支
+    local files_to_keep="$3"
+    local local_hash="$4"
+    local local_branch="$5"
     
-    # 静默执行版本同步
+    ensure_remote_script || return 1
     
-    # 确保远程脚本已上传
-    if ! ensure_remote_script; then
-        echo -e "${RED}[$dir_name] Failed to ensure remote script${NC}"
-        return 1
-    fi
-    
-    # 准备排除模式参数
     local exclude_patterns=$(printf '%s\n' "${EXCLUDE_PATTERNS[@]}" | tr '\n' '|' | sed 's/|$//')
+    local sync_result=$(ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" \
+        "$REMOTE_SCRIPT_PATH sync_version \"$remote_target_dir\" \"$files_to_keep\" \"$local_hash\" \"$local_branch\" \"$exclude_patterns\"")
     
-    # 使用远程脚本执行同步
-    local sync_result=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" \
-        "$REMOTE_SCRIPT_PATH sync_version \"$remote_target_dir\" \"$files_to_keep\" \"$local_hash\" \"$local_branch\" \"$exclude_patterns\"" 2>/dev/null)
-    
-    # 解析同步结果
-    local remote_info=""
     local sync_status=""
-    
     while IFS= read -r line; do
-        if [[ "$line" =~ ^REMOTE_STATUS: ]]; then
-            remote_info="${line#REMOTE_STATUS:}"
-        elif [[ "$line" =~ ^(HASH_MATCH|REMOTE_NEWER|PULLING_TO_LOCAL_HASH|BRANCH_DIVERGED_RESETTING|BRANCH_MISMATCH_SWITCHING|SYNC_COMPLETED|NOT_GIT_REPO|NO_REMOTE_ORIGIN|RESET_FAILED|HASH_NOT_FOUND)$ ]]; then
+        if [[ "$line" =~ ^(HASH_MATCH|REMOTE_NEWER|PULLING_TO_LOCAL_HASH|BRANCH_DIVERGED_RESETTING|BRANCH_MISMATCH_SWITCHING|SYNC_COMPLETED|NOT_GIT_REPO|NO_REMOTE_ORIGIN|RESET_FAILED|HASH_NOT_FOUND)$ ]]; then
             sync_status="$line"
         elif [[ "$line" =~ ^ERROR: ]]; then
-            echo -e "${RED}[$dir_name] ${line#ERROR:}${NC}"
+            output_status "ERROR" "$dir_name"
+            echo "${line#ERROR:}"
             return 1
         fi
     done <<< "$sync_result"
     
-    # 显示同步结果（只显示关键状态）
     case "$sync_status" in
-        "HASH_MATCH")
-            return 0  # 静默跳过，版本已同步
-            ;;
-        "REMOTE_NEWER")
-            echo -e "${CYAN}[$dir_name] Remote version reset to local version${NC}"
-            ;;
-        "PULLING_TO_LOCAL_HASH"|"BRANCH_DIVERGED_RESETTING"|"BRANCH_MISMATCH_SWITCHING")
-            echo -e "${CYAN}[$dir_name] Updated to local version${NC}"
-            ;;
-        "NOT_GIT_REPO"|"RESET_FAILED"|"HASH_NOT_FOUND")
-            echo -e "${RED}[$dir_name] Sync failed: $sync_status${NC}"
-            ;;
-        "NO_REMOTE_ORIGIN")
-            echo -e "${YELLOW}[$dir_name] No remote origin${NC}"
-            ;;
+        "HASH_MATCH") return 0 ;;
+        "REMOTE_NEWER"|"PULLING_TO_LOCAL_HASH"|"BRANCH_DIVERGED_RESETTING"|"BRANCH_MISMATCH_SWITCHING"|"SYNC_COMPLETED")
+            output_status "SUCCESS" "$dir_name" ;;
+        *)
+            output_status "$sync_status" "$dir_name" ;;
     esac
 }
 
-# 安全函数：验证路径是否安全
+# 安全函数：验证路径
 function validate_path() {
     local path="$1"
-    # 检查路径是否包含危险字符，但允许正常的绝对路径
-    if [[ "$path" =~ \.\./|^\.|[\;\|\&\$\`] ]]; then
-        return 1
-    fi
-    # 检查是否包含连续的斜杠（可能的路径注入）
-    if [[ "$path" =~ // ]]; then
-        return 1
-    fi
-    # 检查是否包含危险的系统路径（但允许常用的工作目录）
-    if [[ "$path" =~ ^/etc/|^/boot/|^/sys/|^/proc/|^/dev/ ]]; then
-        return 1
-    fi
+    [[ "$path" =~ \.\./|^\.|[\;\|\&\$\`]|//|^/etc/|^/boot/|^/sys/|^/proc/|^/dev/ ]] && return 1
     return 0
 }
 
-# 安全函数：转义shell特殊字符
+# 安全函数：转义shell参数
 function escape_shell_arg() {
-    local arg="$1"
-    # 使用printf %q进行安全转义
-    printf '%q' "$arg"
+    printf '%q' "$1"
 }
 
-# 功能：执行初始完整同步（优化的压缩传输）
 function perform_initial_sync() {
     local local_dir="$1"
     local remote_target_dir="$2"
     local dir_name="$3"
     
-    # 验证路径安全性
-    if ! validate_path "$remote_target_dir"; then
-        echo -e "${RED}[$dir_name] Invalid remote path detected${NC}"
-        return 1
-    fi
+    validate_path "$remote_target_dir" || return 1
     
-    echo -e "${YELLOW}[$dir_name] Starting initial sync with optimized compression...${NC}"
-    
-    # 统一使用压缩传输（更高效）
     local dir_size=$(du -sm "$local_dir" 2>/dev/null | cut -f1)
-    echo -e "${CYAN}[$dir_name] Directory size: ${dir_size}MB${NC}"
-    
-    # 检查文件数量，选择最优压缩策略
     local file_count=$(find "$local_dir" -type f | wc -l)
-    echo -e "${CYAN}[$dir_name] File count: ${file_count}${NC}"
     
-    if [ "$file_count" -gt 10000 ] || [ "$dir_size" -gt 500 ]; then
-        # 大量文件或超大目录：使用快速压缩
-        echo -e "${CYAN}[$dir_name] Using fast compression for large dataset...${NC}"
-        perform_compressed_initial_sync "$local_dir" "$remote_target_dir" "$dir_name" "fast"
-    else
-        # 普通大小：使用标准压缩
-        echo -e "${CYAN}[$dir_name] Using standard compression...${NC}"
-        perform_compressed_initial_sync "$local_dir" "$remote_target_dir" "$dir_name" "standard"
-    fi
+    local compression_mode="standard"
+    [ "$file_count" -gt 10000 ] || [ "$dir_size" -gt 500 ] && compression_mode="fast"
+    
+    perform_compressed_initial_sync "$local_dir" "$remote_target_dir" "$dir_name" "$compression_mode"
 }
 
-
-
-# 功能：使用优化压缩进行初始同步
 function perform_compressed_initial_sync() {
     local local_dir="$1"
     local remote_target_dir="$2"
     local dir_name="$3"
-    local compression_mode="${4:-standard}"  # fast|standard
+    local compression_mode="${4:-standard}"
     
-    local exclude_args_tar=$(get_tar_exclude_args)
-    local temp_archive=""
-    local compression_level=""
+    local exclude_args=$(get_exclude_args "tar")
+    local temp_archive=$(mktemp --suffix=.tar.lz4)
+    local compression_level="-3"
+    [ "$compression_mode" = "fast" ] && compression_level="-1"
     
-    echo -e "${CYAN}[$dir_name] Creating compressed archive (${compression_mode} mode)...${NC}"
-    
-    # 统一使用LZ4压缩（已确保安装）
-    temp_archive=$(mktemp --suffix=.tar.lz4)
-    case "$compression_mode" in
-        "fast")
-            compression_level="-1"  # 最快压缩
-            echo -e "${CYAN}[$dir_name] Using LZ4 fast compression...${NC}"
-            ;;
-        "standard")
-            compression_level="-3"  # 平衡压缩
-            echo -e "${CYAN}[$dir_name] Using LZ4 standard compression...${NC}"
-            ;;
-    esac
-    
-    # 执行LZ4压缩
-    if ! tar -cf - $exclude_args_tar -C "$local_dir" . | lz4 $compression_level > "$temp_archive" 2>/dev/null; then
-        echo -e "${RED}[$dir_name] Failed to create lz4 archive${NC}"
+    if ! tar -cf - $exclude_args -C "$local_dir" . | lz4 $compression_level > "$temp_archive" 2>/dev/null; then
         rm -f "$temp_archive"
         return 1
     fi
     
-    # 显示压缩后的文件大小
-    local archive_size=$(du -h "$temp_archive" 2>/dev/null | cut -f1)
-    echo -e "${CYAN}[$dir_name] Archive created: ${archive_size}${NC}"
-    
-    # 创建远程目录
     local escaped_remote_dir=$(escape_shell_arg "$remote_target_dir")
-    if ! ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "mkdir -p $escaped_remote_dir" 2>/dev/null; then
-        echo -e "${RED}[$dir_name] Failed to create remote directory${NC}"
+    if ! ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "mkdir -p $escaped_remote_dir"; then
         rm -f "$temp_archive"
         return 1
     fi
     
-    # 使用优化的传输参数上传
-    echo -e "${CYAN}[$dir_name] Uploading archive (${archive_size})...${NC}"
-    
-    # LZ4文件传输参数（禁用SSH压缩）
-    local transfer_args=(
-        "-P" "$REMOTE_PORT"
-        "-o" "Compression=no"        # 禁用SSH压缩
-        "-o" "ConnectTimeout=10"
-        "-o" "ServerAliveInterval=60"
-        "$temp_archive"
-        "$REMOTE_HOST:$remote_target_dir/project.tar.lz4"
-    )
-    
-    # 显示传输进度（如果有pv工具）
+    local upload_success=false
     if command -v pv >/dev/null 2>&1; then
-        echo -e "${CYAN}[$dir_name] Transferring with progress monitor...${NC}"
-        pv "$temp_archive" | ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "cat > $remote_target_dir/project.tar.${temp_archive##*.}"
-        local upload_result=$?
+        pv "$temp_archive" | ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "cat > $remote_target_dir/project.tar.lz4" && upload_success=true
     else
-        # 使用标准scp传输
-        scp "${transfer_args[@]}" 2>/dev/null
-        local upload_result=$?
+        scp -P "$REMOTE_PORT" "$temp_archive" "$REMOTE_HOST:$remote_target_dir/project.tar.lz4" 2>/dev/null && upload_success=true
     fi
     
-    if [ $upload_result -ne 0 ]; then
-        echo -e "${RED}[$dir_name] Failed to upload archive${NC}"
+    if [ "$upload_success" = true ]; then
+        local extract_result=$(ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "cd $(escape_shell_arg "$remote_target_dir") && lz4 -dc project.tar.lz4 | tar -xf - && rm -f project.tar.lz4 && echo 'SUCCESS'")
         rm -f "$temp_archive"
-        return 1
+        [ "$extract_result" = "SUCCESS" ] && return 0
     fi
-    
-    # 远程解压
-    echo -e "${CYAN}[$dir_name] Extracting archive on remote server...${NC}"
-    local extract_cmd=""
-    local archive_name=""
-    
-    # 原子性操作：解压lz4文件并立即删除
-    extract_cmd="lz4 -dc project.tar.lz4 | tar -xf - && rm -f project.tar.lz4"
-    
-    local remote_extract_result=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "
-        cd $(escape_shell_arg "$remote_target_dir") && 
-        $extract_cmd && 
-        echo 'SUCCESS'
-    " 2>/dev/null)
     
     rm -f "$temp_archive"
-    
-    if [ "$remote_extract_result" = "SUCCESS" ]; then
-        echo -e "${GREEN}[$dir_name] Optimized sync completed${NC}"
-        return 0
-    else
-        echo -e "${RED}[$dir_name] Failed to extract on remote${NC}"
-        return 1
-    fi
+    return 1
 }
 
 function sync_files() {
@@ -570,167 +387,59 @@ function sync_files() {
         local dir_name=$(basename "$local_dir")
         local remote_target_dir="$REMOTE_DIR/$dir_name"
         
-        # 检查本地目录是否存在
-        if [ ! -d "$local_dir" ]; then
-            echo -e "${RED}[$dir_name] Directory not found${NC}"
-            continue
-        fi
+        [ ! -d "$local_dir" ] && { output_status "ERROR" "$dir_name"; echo "目录不存在"; continue; }
+        [ ! -d "$local_dir/.git" ] && continue
+        cd "$local_dir" 2>/dev/null || { output_status "ERROR" "$dir_name"; echo "无法访问目录"; continue; }
         
-        # 检查本地是否为git仓库
-        if [ ! -d "$local_dir/.git" ]; then
-            echo -e "${YELLOW}[$dir_name] Not a git repository, skipping...${NC}"
-            continue
-        fi
+        ensure_remote_script || { output_status "ERROR" "$dir_name"; echo "远程脚本失败"; continue; }
         
-        if ! cd "$local_dir" 2>/dev/null; then
-            echo -e "${RED}[$dir_name] Cannot access directory${NC}"
-            continue
-        fi
-        
-        # 首先检查远程目录是否存在项目
-        # 确保远程脚本已上传
-        if ! ensure_remote_script; then
-            echo -e "${RED}[$dir_name] Failed to ensure remote script${NC}"
-            continue
-        fi
-        
-        local remote_exists=$(ssh "$REMOTE_HOST" -p "$REMOTE_PORT" \
-            "$REMOTE_SCRIPT_PATH check_repo \"$remote_target_dir\"" 2>/dev/null)
+        local remote_exists=$(ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "$REMOTE_SCRIPT_PATH check_repo \"$remote_target_dir\"")
         
         if [ "$remote_exists" = "not_exists" ]; then
-            # 执行初始完整同步
-            perform_initial_sync "$local_dir" "$remote_target_dir" "$dir_name"
+            if perform_initial_sync "$local_dir" "$remote_target_dir" "$dir_name" 2>/dev/null; then
+                output_status "SUCCESS" "$dir_name"
+            else
+                output_status "ERROR" "$dir_name"
+                echo "初始同步失败"
+            fi
             continue
         fi
         
-        # 远程项目存在，检查是否有需要同步的变更
-        # 获取当前分支名或HEAD状态
         local current_branch=$(git branch --show-current 2>/dev/null)
-        local is_detached_head=false
+        [ -z "$current_branch" ] && current_branch="main"
         
-        if [ -z "$current_branch" ]; then
-            # 检查是否处于detached HEAD状态
-            if git symbolic-ref HEAD >/dev/null 2>&1; then
-                echo -e "${RED}[$dir_name] Unable to determine current branch${NC}"
-                continue
-            else
-                # 处于detached HEAD状态
-                is_detached_head=true
-                local current_commit=$(git rev-parse HEAD 2>/dev/null)
-                echo -e "${YELLOW}[$dir_name] Detached HEAD at ${current_commit:0:8}${NC}"
-                
-                # 尝试找到包含当前commit的分支
-                local containing_branches=$(git branch --contains HEAD 2>/dev/null | grep -v '(HEAD detached' | head -1 | sed 's/^[* ] *//')
-                if [ -n "$containing_branches" ]; then
-                    current_branch="$containing_branches"
-                    echo -e "${CYAN}[$dir_name] Using branch: $current_branch (contains current commit)${NC}"
-                else
-                    # 如果找不到包含的分支，使用master/main作为默认分支
-                    if git show-ref --verify --quiet refs/heads/master; then
-                        current_branch="master"
-                    elif git show-ref --verify --quiet refs/heads/main; then
-                        current_branch="main"
-                    else
-                        echo -e "${RED}[$dir_name] Cannot determine branch for detached HEAD${NC}"
-                        continue
-                    fi
-                    echo -e "${CYAN}[$dir_name] Using default branch: $current_branch${NC}"
-                fi
-            fi
-        fi
+        local modified_files=$(git diff --name-only 2>/dev/null)
+        local staged_files=$(git diff --cached --name-only 2>/dev/null)
+        local untracked_files=$(git ls-files --others --exclude-standard 2>/dev/null)
         
-        # 检查远程分支是否存在
-        local remote_branch="origin/$current_branch"
-        if ! git rev-parse --verify "$remote_branch" >/dev/null 2>&1; then
-            # 如果远程分支不存在，检查是否有未提交的更改
-            if git diff --quiet && git diff --cached --quiet; then
-                # 即使没有本地更改，也要确保远程保持最新
-                local local_hash=$(git rev-parse HEAD 2>/dev/null)
-                echo -e "${YELLOW}[$dir_name] No local changes, updating remote...${NC}"
-                update_remote_repository "$remote_target_dir" "$dir_name" "" "$local_hash" "$current_branch"
-                continue
-            fi
-        else
-            # 检查是否有未推送到远程主分支的提交
-            local unpushed_commits=$(git rev-list --count "$remote_branch..HEAD" 2>/dev/null || echo "0")
-            local uncommitted_changes=false
-            
-            # 同时检查是否有未提交的更改
-            if ! git diff --quiet || ! git diff --cached --quiet; then
-                uncommitted_changes=true
-            fi
-            
-            if [ "$unpushed_commits" -eq 0 ] && [ "$uncommitted_changes" = false ]; then
-                # 即使没有本地更改，也要确保远程保持最新
-                local local_hash=$(git rev-parse HEAD 2>/dev/null)
-                echo -e "${YELLOW}[$dir_name] No local changes, updating remote...${NC}"
-                update_remote_repository "$remote_target_dir" "$dir_name" "" "$local_hash" "$current_branch"
-                continue
-            fi
-        fi
-        
-        # 获取需要同步的文件列表
-        local modified_files=$(git diff --name-only)
-        local staged_files=$(git diff --cached --name-only)
-        local untracked_files=$(git ls-files --others --exclude-standard)
-        
-        # 获取未推送提交中的文件
         local unpushed_files=""
         local remote_branch="origin/$current_branch"
         if git rev-parse --verify "$remote_branch" >/dev/null 2>&1; then
             unpushed_files=$(git diff --name-only "$remote_branch..HEAD" 2>/dev/null || echo "")
         fi
         
-        # 合并所有需要同步的文件
         local all_files="$modified_files"$'\n'"$staged_files"$'\n'"$untracked_files"$'\n'"$unpushed_files"
         local unique_files=$(echo "$all_files" | grep -v '^$' | sort -u)
         
-        if [ -z "$unique_files" ]; then
-            echo -e "${GREEN}[$dir_name] No changes to sync${NC}"
-            continue
-        fi
+        [ -z "$unique_files" ] && continue
         
-        # 统计文件数量
         local file_count=$(echo "$unique_files" | wc -l)
-        local modified_count=$(echo "$modified_files" | grep -v '^$' | wc -l)
-        local staged_count=$(echo "$staged_files" | grep -v '^$' | wc -l)
-        local untracked_count=$(echo "$untracked_files" | grep -v '^$' | wc -l)
-        local unpushed_count=$(echo "$unpushed_files" | grep -v '^$' | wc -l)
+        echo "[$dir_name] 同步 $file_count 个文件"
         
-        local sync_info=""
-        [ $modified_count -gt 0 ] && sync_info+="M:$modified_count "
-        [ $staged_count -gt 0 ] && sync_info+="S:$staged_count "
-        [ $untracked_count -gt 0 ] && sync_info+="U:$untracked_count "
-        [ $unpushed_count -gt 0 ] && sync_info+="P:$unpushed_count "
-        
-        echo -e "${YELLOW}[$dir_name] Syncing $file_count files ($sync_info)${NC}"
-        
-        # 在同步前，智能版本同步和回滚远程不需要的文件
         local local_hash=$(git rev-parse HEAD 2>/dev/null)
         update_remote_repository "$remote_target_dir" "$dir_name" "$unique_files" "$local_hash" "$current_branch"
         
-        # 使用rsync同步特定文件（高性能版本）
         if [ -n "$unique_files" ]; then
             local remote_target="${REMOTE_HOST}:${remote_target_dir}/"
             local include_args=""
             
-            # 安全的文件路径处理
             while IFS= read -r file; do
-                if [ -n "$file" ]; then
-                    # 验证文件路径安全性
-                    if ! validate_path "$file"; then
-                        echo -e "${YELLOW}[$dir_name] Skipping unsafe path: $file${NC}"
-                        continue
-                    fi
-                    
+                if [ -n "$file" ] && validate_path "$file"; then
                     include_args+="--include=$(escape_shell_arg "$file") "
                     local dir_path=$(dirname "$file")
-                    # 限制目录遍历深度，防止无限循环
                     local depth=0
                     while [ "$dir_path" != "." ] && [ "$dir_path" != "/" ] && [ $depth -lt 20 ]; do
-                        if validate_path "$dir_path"; then
-                            include_args+="--include=$(escape_shell_arg "$dir_path")/ "
-                        fi
+                        validate_path "$dir_path" && include_args+="--include=$(escape_shell_arg "$dir_path")/ "
                         dir_path=$(dirname "$dir_path")
                         ((depth++))
                     done
@@ -739,130 +448,88 @@ function sync_files() {
             
             include_args+="--exclude=* "
             
-            # 使用高性能rsync参数
             local rsync_args=(
-                "-avz"
-                "--compress-level=1"      # 低压缩级别，更快
-                "--whole-file"           # 传输整个文件
-                "--partial"              # 支持断点续传
-                $include_args
-                $exclude_args
+                "-avz" "--compress-level=1" "--whole-file" "--partial"
+                $include_args $exclude_args
                 "-e" "ssh -p $REMOTE_PORT -o Compression=no -o ConnectTimeout=10"
-                "$local_dir/"
-                "$remote_target"
+                "$local_dir/" "$remote_target"
             )
             
-            # 静默执行rsync
             if rsync "${rsync_args[@]}" >/dev/null 2>&1; then
-                echo -e "${GREEN}[$dir_name] Files synced${NC}"
+                output_status "SUCCESS" "$dir_name"
             else
-                echo -e "${RED}[$dir_name] Sync failed${NC}"
+                output_status "ERROR" "$dir_name"
+                echo "文件同步失败"
             fi
         fi
     done
 }
 
 function show_config() {
-    echo -e "${CYAN}=== Git Sync Service ===${NC}"
-    echo -e "${WHITE}Remote: $REMOTE_HOST:$REMOTE_DIR | Interval: ${REFRESH_INTERVAL}s | Repos: ${#LOCAL_DIRS[@]}${NC}"
-    echo ""
+    if [ "$LOOP_COUNTER" -eq 0 ]; then
+        echo "=== Git 同步服务 ==="
+        echo "远程: $REMOTE_HOST:$REMOTE_DIR | 间隔: ${REFRESH_INTERVAL}s | 仓库: ${#LOCAL_DIRS[@]}个"
+        echo "日志: 仅记录在远程服务器"
+        echo ""
+    fi
 }
 
-# 信号处理函数
 function cleanup() {
-    echo -e "\n${YELLOW}Received interrupt signal, stopping sync...${NC}"
-    # 清理临时文件
-    rm -f /tmp/sync_*.tar.gz 2>/dev/null || true
-    echo -e "${CYAN}Loop statistics: $LOOP_COUNTER iterations, $ERROR_COUNTER errors${NC}"
+    echo "接收到中断信号，正在停止同步..."
+    rm -f /tmp/sync_*.tar.* 2>/dev/null || true
+    echo "循环统计: $LOOP_COUNTER 次迭代, $ERROR_COUNTER 个错误"
     exit 0
 }
 
-# 安全函数：检查系统资源
 function check_system_resources() {
-    # 检查内存使用率
     local mem_usage=$(free | awk 'NR==2{printf "%.0f", $3*100/$2}' 2>/dev/null || echo "0")
-    if [ "$mem_usage" -gt 90 ]; then
-        echo -e "${RED}Warning: High memory usage (${mem_usage}%)${NC}"
-        return 1
-    fi
+    [ "$mem_usage" -gt 90 ] && return 1
     
-    # 检查磁盘空间
     local disk_usage=$(df / | awk 'NR==2{print $5}' | sed 's/%//' 2>/dev/null || echo "0")
-    if [ "$disk_usage" -gt 95 ]; then
-        echo -e "${RED}Warning: Low disk space (${disk_usage}% used)${NC}"
-        return 1
-    fi
+    [ "$disk_usage" -gt 95 ] && return 1
     
     return 0
 }
 
-# 安全函数：循环保护检查
 function check_loop_safety() {
     ((LOOP_COUNTER++))
     
-    # 检查循环次数
-    if [ $LOOP_COUNTER -gt $MAX_LOOPS ]; then
-        echo -e "${RED}Error: Maximum loop count reached. Exiting for safety.${NC}"
-        return 1
-    fi
+    [ $LOOP_COUNTER -gt $MAX_LOOPS ] && { echo "达到最大循环次数，安全退出"; return 1; }
+    [ $ERROR_COUNTER -gt $MAX_ERRORS ] && { echo "错误次数过多，安全退出"; return 1; }
     
-    # 检查错误次数
-    if [ $ERROR_COUNTER -gt $MAX_ERRORS ]; then
-        echo -e "${RED}Error: Too many errors encountered. Exiting for safety.${NC}"
-        return 1
-    fi
-    
-    # 每100次循环检查一次系统资源
     if [ $((LOOP_COUNTER % 100)) -eq 0 ]; then
-        if ! check_system_resources; then
-            ((ERROR_COUNTER++))
-            return 1
-        fi
+        check_system_resources || { ((ERROR_COUNTER++)); return 1; }
     fi
     
     return 0
 }
 
-# 主执行逻辑 - 只有直接运行脚本时才执行
+# 主执行逻辑
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-    # 设置信号处理
     trap cleanup SIGINT SIGTERM
 
-    # 初始加载配置
     if ! load_cached_config; then
         load_config
     fi
 
-    # 显示配置信息
     show_config
 
-    # 主循环（安全版本）
-    echo -e "${GREEN}Git sync started. Press Ctrl+C to stop.${NC}"
+    echo "Git 同步已启动（静默模式）。按 Ctrl+C 停止。"
+    echo "详细日志记录在远程服务器。"
     echo ""
 
     while true; do
-        # 循环安全检查
-        if ! check_loop_safety; then
-            echo -e "${RED}Safety check failed. Stopping sync service.${NC}"
-            break
-        fi
+        check_loop_safety || { echo "安全检查失败，停止同步服务"; break; }
         
-        # 每次循环前检查配置文件是否有变化
-        if ! load_config; then
-            echo -e "${YELLOW}Failed to load config, using cached version${NC}"
-            ((ERROR_COUNTER++))
-        fi
+        load_config >/dev/null 2>&1 || ((ERROR_COUNTER++))
         
-        # 执行同步，捕获错误
-        if ! sync_files; then
-            echo -e "${YELLOW}Sync failed, continuing...${NC}"
-            ((ERROR_COUNTER++))
-        else
-            # 成功执行，重置错误计数器
+        if sync_files 2>/dev/null; then
             ERROR_COUNTER=0
+        else
+            ((ERROR_COUNTER++))
+            [ $ERROR_COUNTER -gt 3 ] && echo "检测到多次同步失败 (次数: $ERROR_COUNTER)"
         fi
         
-        # 静默等待下次检查
         sleep "$REFRESH_INTERVAL"
     done
 fi 
