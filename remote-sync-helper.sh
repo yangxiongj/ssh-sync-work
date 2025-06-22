@@ -305,14 +305,11 @@ function smart_rollback() {
 # 检查Git仓库
 function check_git_repo() {
     local target_dir="$1"
-    
-    write_log "INFO" "检查Git仓库: $target_dir" "CHECK"
-    
+
     if [ -d "$target_dir" ] && [ -d "$target_dir/.git" ]; then
-        write_log "INFO" "Git仓库存在: $target_dir" "CHECK"
         echo 'exists'
     else
-        write_log "INFO" "Git仓库不存在: $target_dir" "CHECK"
+        write_log "ERROR" "Git仓库不存在: $target_dir" "CHECK"
         echo 'not_exists'
     fi
 }
