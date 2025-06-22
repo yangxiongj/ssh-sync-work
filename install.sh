@@ -58,7 +58,10 @@ function init_remote_logging() {
         return 1
     fi
     
-    local remote_setup_script='#!/bin/bash
+    # 创建远程脚本内容
+    local remote_setup_script
+    remote_setup_script=$(cat << 'REMOTE_SCRIPT'
+#!/bin/bash
 # 远程服务器日志环境初始化脚本
 LOG_DIR=""
 
@@ -119,7 +122,8 @@ else
 fi
 
 echo "$LOG_DIR"
-'
+REMOTE_SCRIPT
+)
     
     if echo "$remote_setup_script" | ssh_exec "$remote_host" "$remote_port" "cat > /tmp/init-remote-logging.sh && chmod +x /tmp/init-remote-logging.sh && /tmp/init-remote-logging.sh && rm -f /tmp/init-remote-logging.sh"; then
         local remote_log_dir=$(ssh_exec "$remote_host" "$remote_port" "
