@@ -10,7 +10,7 @@ directories:
   # - /mnt/d/PycharmProjects/test
 
 # 刷新间隔 (秒)
-refresh_interval: 20
+refresh_interval: 10
 
 # 排除模式配置
 exclude_patterns:

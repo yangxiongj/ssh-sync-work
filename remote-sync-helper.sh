@@ -11,11 +11,12 @@ CYAN='\033[0;36m'
 GRAY='\033[0;37m'
 NC='\033[0m'
 
-# 日志配置 - 由install.sh预设
-LOG_DIR="${SYNC_LOG_DIR:-/tmp/sync-logs}"
-SYNC_LOG="$LOG_DIR/sync.log"
-ERROR_LOG="$LOG_DIR/error.log"
-OPERATIONS_LOG="$LOG_DIR/operations.log"
+# 日志配置 - 统一使用 /tmp/sync/ 目录
+BASE_LOG_DIR="/tmp/sync"
+LOG_DIR=""  # 将根据目标目录动态设置
+SYNC_LOG=""
+ERROR_LOG=""
+OPERATIONS_LOG=""
 
 # 状态码定义
 declare -A SYNC_STATUS=(
@@ -32,6 +33,17 @@ declare -A SYNC_STATUS=(
     ["HASH_NOT_FOUND"]="哈希未找到"
 )
 
+# 根据目标目录设置日志路径
+function setup_log_paths() {
+    local target_dir="$1"
+    local dir_name=$(basename "$target_dir")
+    
+    LOG_DIR="$BASE_LOG_DIR/$dir_name"
+    SYNC_LOG="$LOG_DIR/sync.log"
+    ERROR_LOG="$LOG_DIR/error.log"
+    OPERATIONS_LOG="$LOG_DIR/operations.log"
+}
+
 # 确保日志目录和文件存在
 function ensure_log_dir() {
     if [ ! -d "$LOG_DIR" ]; then
@@ -42,6 +54,21 @@ function ensure_log_dir() {
     [ ! -f "$SYNC_LOG" ] && touch "$SYNC_LOG" 2>/dev/null
     [ ! -f "$ERROR_LOG" ] && touch "$ERROR_LOG" 2>/dev/null
     [ ! -f "$OPERATIONS_LOG" ] && touch "$OPERATIONS_LOG" 2>/dev/null
+}
+
+# 清理过期日志文件
+function cleanup_old_logs() {
+    local log_dir="$1"
+    local days_to_keep="${2:-7}"  # 默认保留7天的日志
+    
+    if [ -d "$log_dir" ]; then
+        # 删除超过指定天数的日志文件
+        find "$log_dir" -name "*.log" -type f -mtime +$days_to_keep -delete 2>/dev/null || true
+        find "$log_dir" -name "*.log.old" -type f -mtime +$days_to_keep -delete 2>/dev/null || true
+        
+        # 如果目录为空，也删除目录
+        rmdir "$log_dir" 2>/dev/null || true
+    fi
 }
 
 # 统一的日志记录函数
@@ -132,6 +159,12 @@ function sync_version() {
     local local_branch="$4"
     local exclude_patterns="$5"
     
+    # 根据目标目录设置日志路径
+    setup_log_paths "$target_dir"
+    
+    # 清理过期日志（保留7天）
+    cleanup_old_logs "$LOG_DIR" 7
+    
     log_operation "版本同步" "$target_dir" "开始同步到本地版本 ${local_hash:0:8}"
     
     cd "$target_dir" 2>/dev/null || {
@@ -160,14 +193,18 @@ function sync_version() {
     
     write_log "INFO" "开始同步。远程: ${remote_hash:0:8}, 本地: ${local_hash:0:8}" "SYNC"
     
-    # 智能文件回滚
-    smart_rollback "$files_to_keep" "$exclude_patterns"
-
     if [ "$remote_hash" = "$local_hash" ]; then
-            write_log "INFO" "哈希相同，无需处理。远程: ${remote_hash:0:8}, 本地: ${local_hash:0:8}" "SYNC"
-            echo 'HASH_MATCH'
+            # 即使哈希相同，也需要处理工作区文件同步
+            smart_rollback_without_delete "$files_to_keep" "$exclude_patterns"
+            handle_file_deletions "$files_to_keep"
+            
+            log_git_status "$target_dir" "同步后状态"
+            log_operation "版本同步" "$target_dir" "哈希匹配，仅处理工作区文件 ${local_hash:0:8}" "SUCCESS"
             return 0
     fi
+    
+    # 先进行常规文件回滚（不包括删除操作）
+    smart_rollback_without_delete "$files_to_keep" "$exclude_patterns"
     
     # 版本同步逻辑
     if [ "$remote_branch" = "$local_branch" ]; then
@@ -191,6 +228,9 @@ function sync_version() {
         echo 'BRANCH_MISMATCH_SWITCHING'
         force_reset_to_hash "$local_hash"
     fi
+    
+    # 版本同步完成后，处理删除文件
+    handle_file_deletions "$files_to_keep"
     
     log_git_status "$target_dir" "同步后状态"
     log_operation "版本同步" "$target_dir" "完成同步到 ${local_hash:0:8}" "SUCCESS"
@@ -234,25 +274,60 @@ function force_reset_to_hash() {
     return 1
 }
 
-# 智能文件回滚
-function smart_rollback() {
+# 处理文件删除（在Git重置之后）
+function handle_file_deletions() {
+    local keep_files="$1"
+    
+    write_log "INFO" "开始处理文件删除" "DELETE"
+    
+    local deleted_count=0
+    if [ -n "$keep_files" ]; then
+        while IFS= read -r file_entry; do
+            if [[ "$file_entry" =~ ^DEL: ]]; then
+                local file_to_delete="${file_entry#DEL:}"
+                if [[ "$file_to_delete" != /* ]] && [[ "$file_to_delete" != ../* ]] && [ -f "$file_to_delete" ]; then
+                    if rm -f "$file_to_delete" 2>/dev/null; then
+                        write_log "INFO" "删除文件: $file_to_delete" "DELETE"
+                        ((deleted_count++))
+                    else
+                        write_log "WARN" "删除文件失败: $file_to_delete" "DELETE"
+                    fi
+                else
+                    write_log "WARN" "跳过删除不安全路径: $file_to_delete" "DELETE"
+                fi
+            fi
+        done <<< "$keep_files"
+    fi
+    
+    write_log "INFO" "文件删除完成。删除: $deleted_count 个文件" "DELETE"
+}
+
+# 智能文件回滚（基于同步文件列表）
+function smart_rollback_without_delete() {
     local keep_files="$1"
     local exclude_patterns="$2"
     
-    write_log "INFO" "开始智能文件回滚" "ROLLBACK"
+    write_log "INFO" "开始智能文件回滚（基于同步文件列表）" "ROLLBACK"
     
-    local all_files=$(git ls-files 2>/dev/null)
-    local all_untracked=$(git ls-files --others --exclude-standard 2>/dev/null)
+    # 提取非删除标记的同步文件列表
+    local sync_files=""
+    if [ -n "$keep_files" ]; then
+        sync_files=$(echo "$keep_files" | grep -v "^DEL:" | grep -v "^$")
+    fi
+    
     local rollback_count=0
     local kept_count=0
+    local deleted_count=0
     
-    # 处理已跟踪文件
-    if [ -n "$all_files" ]; then
+    # 处理已跟踪文件的变更：回滚那些不在同步列表中的文件
+    # 包括修改的文件和删除的文件（这些文件需要被恢复）
+    local modified_files=$(git diff --name-only 2>/dev/null)
+    if [ -n "$modified_files" ]; then
         while IFS= read -r file; do
             local should_keep=false
             
-            # 检查保留列表
-            if echo "$keep_files" | grep -q "^$file$"; then
+            # 检查文件是否在同步文件列表中
+            if [ -n "$sync_files" ] && echo "$sync_files" | grep -q "^$file$"; then
                 should_keep=true
             fi
             
@@ -263,23 +338,27 @@ function smart_rollback() {
             
             if [ "$should_keep" = false ]; then
                 if git checkout HEAD -- "$file" 2>/dev/null; then
+                    write_log "INFO" "回滚文件到HEAD版本: $file" "ROLLBACK"
                     ((rollback_count++))
                 fi
             else
                 ((kept_count++))
             fi
-        done <<< "$all_files"
+        done <<< "$modified_files"
     fi
     
-    # 处理未跟踪文件
+    # 处理未跟踪文件：删除那些不在同步文件列表中的文件
+    local all_untracked=$(git ls-files --others --exclude-standard 2>/dev/null)
     if [ -n "$all_untracked" ]; then
         while IFS= read -r file; do
             local should_keep=false
             
-            if echo "$keep_files" | grep -q "^$file$"; then
+            # 检查文件是否在同步文件列表中
+            if [ -n "$sync_files" ] && echo "$sync_files" | grep -q "^$file$"; then
                 should_keep=true
             fi
             
+            # 检查排除模式
             if [ -n "$exclude_patterns" ] && echo "$file" | grep -E "$exclude_patterns" >/dev/null 2>&1; then
                 should_keep=true
             fi
@@ -288,7 +367,8 @@ function smart_rollback() {
                 # 确保文件在Git工作区内且是相对路径
                 if [[ "$file" != /* ]] && [ -f "$file" ] && [[ "$file" != ../* ]]; then
                     if rm -f "$file" 2>/dev/null; then
-                        ((rollback_count++))
+                        write_log "INFO" "删除未同步的未跟踪文件: $file" "ROLLBACK"
+                        ((deleted_count++))
                     fi
                 else
                     write_log "WARN" "跳过删除工作区外文件: $file" "ROLLBACK"
@@ -299,12 +379,15 @@ function smart_rollback() {
         done <<< "$all_untracked"
     fi
     
-    write_log "INFO" "智能回滚完成。回滚: $rollback_count 个文件，保留: $kept_count 个文件" "ROLLBACK"
+    write_log "INFO" "智能回滚完成。回滚: $rollback_count 个文件，删除未跟踪: $deleted_count 个文件，保留: $kept_count 个文件" "ROLLBACK"
 }
 
 # 检查Git仓库
 function check_git_repo() {
     local target_dir="$1"
+    
+    # 设置日志路径（即使仓库不存在也需要记录日志）
+    setup_log_paths "$target_dir"
 
     if [ -d "$target_dir" ] && [ -d "$target_dir/.git" ]; then
         echo 'exists'
@@ -316,42 +399,139 @@ function check_git_repo() {
 
 # 日志轮转
 function rotate_logs() {
-    ensure_log_dir
+    local target_dir="${1:-}"
     
-    for log_file in "$SYNC_LOG" "$ERROR_LOG" "$OPERATIONS_LOG"; do
-        if [ -f "$log_file" ] && [ $(stat -c%s "$log_file" 2>/dev/null || echo 0) -gt 10485760 ]; then
-            mv "$log_file" "${log_file}.old" 2>/dev/null
-            touch "$log_file" 2>/dev/null
-            write_log "INFO" "日志轮转: $(basename "$log_file")" "SYSTEM"
+    if [ -n "$target_dir" ]; then
+        # 轮转指定仓库的日志
+        setup_log_paths "$target_dir"
+        ensure_log_dir
+        
+        for log_file in "$SYNC_LOG" "$ERROR_LOG" "$OPERATIONS_LOG"; do
+            if [ -f "$log_file" ] && [ $(stat -c%s "$log_file" 2>/dev/null || echo 0) -gt 10485760 ]; then
+                mv "$log_file" "${log_file}.old" 2>/dev/null
+                touch "$log_file" 2>/dev/null
+                write_log "INFO" "日志轮转: $(basename "$log_file")" "SYSTEM"
+            fi
+        done
+    else
+        # 轮转所有仓库的日志
+        if [ -d "$BASE_LOG_DIR" ]; then
+            for repo_dir in "$BASE_LOG_DIR"/*; do
+                if [ -d "$repo_dir" ]; then
+                    local repo_name=$(basename "$repo_dir")
+                    LOG_DIR="$repo_dir"
+                    SYNC_LOG="$LOG_DIR/sync.log"
+                    ERROR_LOG="$LOG_DIR/error.log"
+                    OPERATIONS_LOG="$LOG_DIR/operations.log"
+                    
+                    for log_file in "$SYNC_LOG" "$ERROR_LOG" "$OPERATIONS_LOG"; do
+                        if [ -f "$log_file" ] && [ $(stat -c%s "$log_file" 2>/dev/null || echo 0) -gt 10485760 ]; then
+                            mv "$log_file" "${log_file}.old" 2>/dev/null
+                            touch "$log_file" 2>/dev/null
+                            echo "日志轮转: $repo_name/$(basename "$log_file")"
+                        fi
+                    done
+                fi
+            done
         fi
-    done
+    fi
+}
+
+# 清理所有仓库的过期日志
+function cleanup_all_logs() {
+    local days_to_keep="${1:-7}"
+    
+    if [ -d "$BASE_LOG_DIR" ]; then
+        echo "开始清理 $BASE_LOG_DIR 中超过 $days_to_keep 天的日志文件..."
+        
+        for repo_dir in "$BASE_LOG_DIR"/*; do
+            if [ -d "$repo_dir" ]; then
+                local repo_name=$(basename "$repo_dir")
+                echo "清理仓库: $repo_name"
+                cleanup_old_logs "$repo_dir" "$days_to_keep"
+            fi
+        done
+        
+        # 清理空的基础目录
+        rmdir "$BASE_LOG_DIR" 2>/dev/null || true
+        echo "日志清理完成"
+    else
+        echo "日志目录不存在: $BASE_LOG_DIR"
+    fi
 }
 
 # 查看日志
 function show_logs() {
     local log_type="${1:-sync}"
-    local lines="${2:-50}"
+    local repo_name="${2:-}"
+    local lines="${3:-50}"
     
-    ensure_log_dir
-    
-    case "$log_type" in
-        "sync")
-            [ -f "$SYNC_LOG" ] && tail -n "$lines" "$SYNC_LOG" || echo "同步日志不存在"
-            ;;
-        "error")
-            [ -f "$ERROR_LOG" ] && tail -n "$lines" "$ERROR_LOG" || echo "错误日志不存在"
-            ;;
-        "operations")
-            [ -f "$OPERATIONS_LOG" ] && tail -n "$lines" "$OPERATIONS_LOG" || echo "操作日志不存在"
-            ;;
-        "recent")
-            echo "=== 最近的同步活动 ==="
-            [ -f "$SYNC_LOG" ] && tail -n 20 "$SYNC_LOG" | grep -E "(OPERATION|ERROR)" || echo "无最近活动"
-            ;;
-        *)
-            echo "用法: show_logs {sync|error|operations|recent} [行数]"
-            ;;
-    esac
+    if [ -n "$repo_name" ]; then
+        # 查看指定仓库的日志
+        LOG_DIR="$BASE_LOG_DIR/$repo_name"
+        SYNC_LOG="$LOG_DIR/sync.log"
+        ERROR_LOG="$LOG_DIR/error.log"
+        OPERATIONS_LOG="$LOG_DIR/operations.log"
+        
+        case "$log_type" in
+            "sync")
+                [ -f "$SYNC_LOG" ] && tail -n "$lines" "$SYNC_LOG" || echo "[$repo_name] 同步日志不存在"
+                ;;
+            "error")
+                [ -f "$ERROR_LOG" ] && tail -n "$lines" "$ERROR_LOG" || echo "[$repo_name] 错误日志不存在"
+                ;;
+            "operations")
+                [ -f "$OPERATIONS_LOG" ] && tail -n "$lines" "$OPERATIONS_LOG" || echo "[$repo_name] 操作日志不存在"
+                ;;
+            "recent")
+                echo "=== [$repo_name] 最近的同步活动 ==="
+                [ -f "$SYNC_LOG" ] && tail -n 20 "$SYNC_LOG" | grep -E "(OPERATION|ERROR)" || echo "无最近活动"
+                ;;
+            *)
+                echo "用法: show_logs {sync|error|operations|recent} [仓库名] [行数]"
+                ;;
+        esac
+    else
+        # 查看所有仓库的日志概览
+        case "$log_type" in
+            "list")
+                echo "=== 所有仓库日志概览 ==="
+                if [ -d "$BASE_LOG_DIR" ]; then
+                    for repo_dir in "$BASE_LOG_DIR"/*; do
+                        if [ -d "$repo_dir" ]; then
+                            local repo_name=$(basename "$repo_dir")
+                            echo "仓库: $repo_name"
+                            ls -la "$repo_dir"/*.log 2>/dev/null || echo "  无日志文件"
+                            echo ""
+                        fi
+                    done
+                else
+                    echo "日志目录不存在: $BASE_LOG_DIR"
+                fi
+                ;;
+            "recent")
+                echo "=== 所有仓库最近活动 ==="
+                if [ -d "$BASE_LOG_DIR" ]; then
+                    for repo_dir in "$BASE_LOG_DIR"/*; do
+                        if [ -d "$repo_dir" ]; then
+                            local repo_name=$(basename "$repo_dir")
+                            local sync_log="$repo_dir/sync.log"
+                            if [ -f "$sync_log" ]; then
+                                echo "[$repo_name]:"
+                                tail -n 5 "$sync_log" | grep -E "(OPERATION|ERROR)" || echo "  无最近活动"
+                                echo ""
+                            fi
+                        fi
+                    done
+                else
+                    echo "日志目录不存在: $BASE_LOG_DIR"
+                fi
+                ;;
+            *)
+                echo "用法: show_logs {list|recent} 或 show_logs {sync|error|operations|recent} [仓库名] [行数]"
+                ;;
+        esac
+    fi
 }
 
 # 主执行逻辑
@@ -359,15 +539,31 @@ case "${1:-}" in
     "sync_version")
         sync_version "$2" "$3" "$4" "$5" "$6"
         ;;
+    "check_repo")
+        check_git_repo "$2"
+        ;;
     "rotate_logs")
-        rotate_logs
+        rotate_logs "$2"  # 可选的目标目录参数
+        ;;
+    "cleanup_logs")
+        cleanup_all_logs "$2"  # 可选的保留天数参数
         ;;
     "show_logs")
-        show_logs "$2" "$3"
+        show_logs "$2" "$3" "$4"  # log_type repo_name lines
         ;;
     *)
-        echo "远程同步助手"
-        echo "用法: $0 {sync_version|rotate_logs|show_logs}"
+        echo "远程同步助手 - 统一使用 /tmp/sync/ 目录"
+        echo "用法: $0 {sync_version|check_repo|rotate_logs|cleanup_logs|show_logs}"
+        echo ""
+        echo "命令说明:"
+        echo "  sync_version <target_dir> <files> <hash> <branch> <exclude> - 同步版本"
+        echo "  check_repo <target_dir>                                     - 检查仓库"
+        echo "  rotate_logs [target_dir]                                    - 轮转日志"
+        echo "  cleanup_logs [days]                                         - 清理过期日志(默认7天)"
+        echo "  show_logs list                                              - 列出所有仓库日志"
+        echo "  show_logs recent                                            - 显示所有仓库最近活动"
+        echo "  show_logs <type> <repo> [lines]                            - 显示指定仓库日志"
+        echo "    类型: sync, error, operations, recent"
         exit 1
         ;;
 esac 

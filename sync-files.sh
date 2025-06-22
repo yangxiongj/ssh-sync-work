@@ -50,7 +50,7 @@ CONFIG_CACHE_FILE="/tmp/sync_config_cache"
 
 # 远程脚本配置
 REMOTE_SCRIPT_NAME="remote-sync-helper.sh"
-REMOTE_SCRIPT_PATH="/tmp/$REMOTE_SCRIPT_NAME"
+REMOTE_SCRIPT_PATH="/tmp/sync/$REMOTE_SCRIPT_NAME"
 LOCAL_SCRIPT_PATH="./remote-sync-helper.sh"
 REMOTE_SCRIPT_UPLOADED=false
 
@@ -68,6 +68,12 @@ ERROR_COUNTER=0
 MAX_ERRORS=10
 MAX_LOOPS=86400
 
+# 锁机制配置
+LOCK_FILE="/tmp/sync-files.lock"
+LOCK_TIMEOUT=100  # 5分钟锁超时
+
+#debug 
+DEBUG_MODE=false
 # 状态码定义
 declare -A SYNC_STATUS=(
     ["SUCCESS"]="成功"
@@ -81,6 +87,63 @@ declare -A SYNC_STATUS=(
     ["SPACE_ERROR"]="空间不足"
     ["PERMISSION_ERROR"]="权限错误"
 )
+
+# 锁管理函数
+function acquire_lock() {
+    local max_wait=30  # 最多等待30秒
+    local wait_count=0
+    
+    while [ $wait_count -lt $max_wait ]; do
+        # 尝试创建锁文件
+        if (set -C; echo $$ > "$LOCK_FILE") 2>/dev/null; then
+            # 成功获取锁
+            return 0
+        fi
+        
+        # 检查锁文件是否过期
+        if [ -f "$LOCK_FILE" ]; then
+            local lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+            local lock_time=$(stat -c %Y "$LOCK_FILE" 2>/dev/null)
+            local current_time=$(date +%s)
+            
+            # 检查锁是否超时或进程已不存在
+            if [ -n "$lock_time" ] && [ $((current_time - lock_time)) -gt $LOCK_TIMEOUT ]; then
+                echo "检测到过期锁，清理中..."
+                rm -f "$LOCK_FILE" 2>/dev/null
+                continue
+            elif [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+                echo "检测到死锁（进程$lock_pid已不存在），清理中..."
+                rm -f "$LOCK_FILE" 2>/dev/null
+                continue
+            fi
+        fi
+        
+        echo "等待其他同步任务完成... ($((wait_count + 1))/$max_wait)"
+        sleep 1
+        ((wait_count++))
+    done
+    
+    echo "错误: 无法获取同步锁，可能有其他同步任务正在运行"
+    echo "如果确认没有其他任务，请手动删除锁文件: rm -f $LOCK_FILE"
+    return 1
+}
+
+function release_lock() {
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [ "$lock_pid" = "$$" ]; then
+            rm -f "$LOCK_FILE" 2>/dev/null
+        fi
+    fi
+}
+
+function cleanup_with_lock() {
+    echo "接收到中断信号，正在停止同步..."
+    release_lock
+    rm -f /tmp/sync_*.tar.* 2>/dev/null || true
+    echo "循环统计: $LOOP_COUNTER 次迭代, $ERROR_COUNTER 个错误"
+    exit 0
+}
 
 # 统一的排除参数生成函数
 function get_exclude_args() {
@@ -261,24 +324,7 @@ function load_cached_config() {
     return 1
 }
 
-function ensure_remote_script() {
-    [ "$REMOTE_SCRIPT_UPLOADED" = true ] && return 0
-    
-    if ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "[ -x $REMOTE_SCRIPT_PATH ]"; then
-        REMOTE_SCRIPT_UPLOADED=true
-        return 0
-    fi
-    
-    [ ! -f "$LOCAL_SCRIPT_PATH" ] && return 1
-    
-    if scp -P "$REMOTE_PORT" "$LOCAL_SCRIPT_PATH" "$REMOTE_HOST:$REMOTE_SCRIPT_PATH" 2>/dev/null; then
-        if ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "chmod +x $REMOTE_SCRIPT_PATH"; then
-            REMOTE_SCRIPT_UPLOADED=true
-            return 0
-        fi
-    fi
-    return 1
-}
+
 
 function update_remote_repository() {
     local remote_target_dir="$1"
@@ -286,8 +332,6 @@ function update_remote_repository() {
     local files_to_keep="$3"
     local local_hash="$4"
     local local_branch="$5"
-    
-    ensure_remote_script || return 1
     
     local exclude_patterns=$(printf '%s\n' "${EXCLUDE_PATTERNS[@]}" | tr '\n' '|' | sed 's/|$//')
     local sync_result=$(ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" \
@@ -390,9 +434,7 @@ function sync_files() {
         [ ! -d "$local_dir" ] && { output_status "ERROR" "$dir_name"; echo "目录不存在"; continue; }
         [ ! -d "$local_dir/.git" ] && continue
         cd "$local_dir" 2>/dev/null || { output_status "ERROR" "$dir_name"; echo "无法访问目录"; continue; }
-        
-        ensure_remote_script || { output_status "ERROR" "$dir_name"; echo "远程脚本失败"; continue; }
-        
+                
         local remote_exists=$(ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "$REMOTE_SCRIPT_PATH check_repo \"$remote_target_dir\"")
         
         if [ "$remote_exists" = "not_exists" ]; then
@@ -408,29 +450,60 @@ function sync_files() {
         local current_branch=$(git branch --show-current 2>/dev/null)
         [ -z "$current_branch" ] && current_branch="main"
         
-        local modified_files=$(git diff --name-only 2>/dev/null)
-        local staged_files=$(git diff --cached --name-only 2>/dev/null)
+        # 分别获取各种状态的文件，确保删除文件不会被重复归类
+        local deleted_files_working=$(git diff --name-only --diff-filter=D 2>/dev/null)
+        local deleted_files_staged=$(git diff --cached --name-only --diff-filter=D 2>/dev/null)
+        local deleted_files="$deleted_files_working"$'\n'"$deleted_files_staged"
+        deleted_files=$(echo "$deleted_files" | grep -v '^$' | sort -u)
+        
+        # 获取非删除的文件
+        local modified_files=$(git diff --name-only --diff-filter=AM 2>/dev/null)
+        local staged_files=$(git diff --cached --name-only --diff-filter=AM 2>/dev/null)
         local untracked_files=$(git ls-files --others --exclude-standard 2>/dev/null)
         
         local unpushed_files=""
         local remote_branch="origin/$current_branch"
         if git rev-parse --verify "$remote_branch" >/dev/null 2>&1; then
-            unpushed_files=$(git diff --name-only "$remote_branch..HEAD" 2>/dev/null || echo "")
+            # 检查是否有未推送的提交
+            if ! git merge-base --is-ancestor HEAD "$remote_branch" 2>/dev/null; then
+                # 本地有远程没有的提交，获取这些提交中的文件
+                unpushed_files=$(git diff --name-only "$remote_branch..HEAD" 2>/dev/null || echo "")
+            fi
+        else
+            # 远程分支不存在，获取当前分支的所有文件
+            unpushed_files=$(git ls-files 2>/dev/null || echo "")
         fi
         
-        local all_files="$modified_files"$'\n'"$staged_files"$'\n'"$untracked_files"$'\n'"$unpushed_files"
+        # 处理删除文件，添加DEL:前缀
+        local deleted_files_with_prefix=""
+        if [ -n "$deleted_files" ]; then
+            deleted_files_with_prefix=$(echo "$deleted_files" | sed 's/^/DEL:/')
+        fi
+        
+        local all_files="$modified_files"$'\n'"$staged_files"$'\n'"$untracked_files"$'\n'"$unpushed_files"$'\n'"$deleted_files_with_prefix"
         local unique_files=$(echo "$all_files" | grep -v '^$' | sort -u)
-
+        
+        # 调试信息
+        debug_file_changes "$dir_name" "$modified_files" "$staged_files" "$untracked_files" "$unpushed_files" "$deleted_files" "$unique_files"
+        
         local local_hash=$(git rev-parse HEAD 2>/dev/null)
         
-        # 总是更新远程仓库版本，即使没有文件变更
+        # 正确计算文件数量
+        local file_count=0
+        if [ -n "$unique_files" ]; then
+            file_count=$(echo "$unique_files" | wc -l)
+        fi
+
+        echo "[$dir_name] 需要同步 $file_count 个文件"
+        
+        # 如果没有文件变更，只更新远程仓库版本，跳过文件同步
+        if [ -z "$unique_files" ]; then
+            update_remote_repository "$remote_target_dir" "$dir_name" "$unique_files" "$local_hash" "$current_branch"
+            continue
+        fi
+        
+        # 有文件变更时，先更新远程仓库版本，再进行文件同步
         update_remote_repository "$remote_target_dir" "$dir_name" "$unique_files" "$local_hash" "$current_branch"
-        
-        # 如果没有文件变更，跳过文件同步
-        [ -z "$unique_files" ] && continue
-        
-        local file_count=$(echo "$unique_files" | wc -l)
-        echo "[$dir_name] 同步 $file_count 个文件"
         
         if [ -n "$unique_files" ]; then
             local remote_target="${REMOTE_HOST}:${remote_target_dir}/"
@@ -438,6 +511,10 @@ function sync_files() {
             
             while IFS= read -r file; do
                 if [ -n "$file" ] && validate_path "$file"; then
+                    # 跳过删除标记的文件，这些文件将由远程脚本处理
+                    if [[ "$file" =~ ^DEL: ]]; then
+                        continue
+                    fi
                     include_args+="--include=$(escape_shell_arg "$file") "
                     local dir_path=$(dirname "$file")
                     local depth=0
@@ -478,10 +555,7 @@ function show_config() {
 }
 
 function cleanup() {
-    echo "接收到中断信号，正在停止同步..."
-    rm -f /tmp/sync_*.tar.* 2>/dev/null || true
-    echo "循环统计: $LOOP_COUNTER 次迭代, $ERROR_COUNTER 个错误"
-    exit 0
+    cleanup_with_lock
 }
 
 function check_system_resources() {
@@ -507,9 +581,161 @@ function check_loop_safety() {
     return 0
 }
 
+# 调试函数：显示检测到的文件变更详情
+function debug_file_changes() {
+    local dir_name="$1"
+    local modified_files="$2"
+    local staged_files="$3"
+    local untracked_files="$4"
+    local unpushed_files="$5"
+    local deleted_files="$6"
+    local unique_files="$7"
+    
+    if [ -n "$DEBUG_MODE" ] && [ "$DEBUG_MODE" = "true" ]; then
+        echo "[$dir_name] 文件变更检测详情:"
+        [ -n "$modified_files" ] && echo "  工作区修改: $(echo "$modified_files" | wc -l) 个文件"
+        [ -n "$staged_files" ] && echo "  暂存区文件: $(echo "$staged_files" | wc -l) 个文件"
+        [ -n "$untracked_files" ] && echo "  未跟踪文件: $(echo "$untracked_files" | wc -l) 个文件"
+        [ -n "$unpushed_files" ] && echo "  未推送文件: $(echo "$unpushed_files" | wc -l) 个文件"
+        [ -n "$deleted_files" ] && echo "  删除文件: $(echo "$deleted_files" | wc -l) 个文件"
+        [ -n "$unique_files" ] && echo "  总计需同步: $(echo "$unique_files" | wc -l) 个文件"
+        echo ""
+    fi
+}
+
+# 单次同步执行（带锁）
+function run_sync_once() {
+    # 获取同步锁
+    if ! acquire_lock; then
+        return 1
+    fi
+    
+    # 设置信号处理，确保锁被正确释放
+    trap cleanup_with_lock SIGINT SIGTERM EXIT
+    
+    echo "开始单次同步..."
+    echo "同步锁已获取: $LOCK_FILE (PID: $$)"
+    
+    if ! load_cached_config; then
+        load_config
+    fi
+    
+    local sync_result=0
+    if sync_files; then
+        echo "单次同步完成"
+    else
+        echo "单次同步失败"
+        sync_result=1
+    fi
+    
+    # 释放锁
+    release_lock
+    return $sync_result
+}
+
+# 检查锁状态
+function check_lock_status() {
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        local lock_time=$(stat -c %Y "$LOCK_FILE" 2>/dev/null)
+        local current_time=$(date +%s)
+        
+        echo "同步锁状态: 已锁定"
+        echo "锁文件: $LOCK_FILE"
+        echo "锁进程PID: $lock_pid"
+        
+        if [ -n "$lock_time" ]; then
+            local lock_age=$((current_time - lock_time))
+            echo "锁创建时间: $(date -d "@$lock_time" 2>/dev/null || echo "未知")"
+            echo "锁持续时间: ${lock_age}秒"
+            
+            if [ $lock_age -gt $LOCK_TIMEOUT ]; then
+                echo "警告: 锁已超时（超过${LOCK_TIMEOUT}秒）"
+            fi
+        fi
+        
+        if [ -n "$lock_pid" ]; then
+            if kill -0 "$lock_pid" 2>/dev/null; then
+                echo "锁进程状态: 运行中"
+            else
+                echo "锁进程状态: 已停止（死锁）"
+            fi
+        fi
+    else
+        echo "同步锁状态: 未锁定"
+        echo "锁文件: $LOCK_FILE (不存在)"
+    fi
+}
+
+# 强制清理锁
+function force_unlock() {
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        echo "强制清理同步锁..."
+        echo "锁文件: $LOCK_FILE"
+        echo "锁进程PID: $lock_pid"
+        rm -f "$LOCK_FILE"
+        echo "锁已清理"
+    else
+        echo "没有发现锁文件，无需清理"
+    fi
+}
+
 # 主执行逻辑
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-    trap cleanup SIGINT SIGTERM
+    case "${1:-}" in
+        "once"|"run-once")
+            # 单次同步模式
+            run_sync_once
+            exit $?
+            ;;
+        "lock-status"|"status")
+            # 检查锁状态
+            check_lock_status
+            exit 0
+            ;;
+        "unlock"|"force-unlock")
+            # 强制清理锁
+            force_unlock
+            exit 0
+            ;;
+        "help"|"-h"|"--help")
+            echo "Git 文件同步工具"
+            echo ""
+            echo "用法: $0 [命令]"
+            echo ""
+            echo "命令:"
+            echo "  (无参数)    启动持续同步服务（默认模式）"
+            echo "  once        执行单次同步"
+            echo "  status      检查同步锁状态"
+            echo "  unlock      强制清理同步锁"
+            echo "  help        显示此帮助信息"
+            echo ""
+            echo "锁机制说明:"
+            echo "  - 同步时会创建锁文件防止并发执行"
+            echo "  - 锁文件位置: $LOCK_FILE"
+            echo "  - 锁超时时间: ${LOCK_TIMEOUT}秒"
+            echo "  - 如果检测到死锁会自动清理"
+            exit 0
+            ;;
+        "")
+            # 默认持续同步模式
+            ;;
+        *)
+            echo "错误: 未知命令 '$1'"
+            echo "使用 '$0 help' 查看可用命令"
+            exit 1
+            ;;
+    esac
+    
+    # 持续同步模式
+    # 获取同步锁
+    if ! acquire_lock; then
+        exit 1
+    fi
+    
+    # 设置信号处理，确保锁被正确释放
+    trap cleanup_with_lock SIGINT SIGTERM EXIT
 
     if ! load_cached_config; then
         load_config
@@ -519,6 +745,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 
     echo "Git 同步已启动（静默模式）。按 Ctrl+C 停止。"
     echo "详细日志记录在远程服务器。"
+    echo "同步锁已获取: $LOCK_FILE (PID: $$)"
     echo ""
 
     while true; do
@@ -535,4 +762,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
         
         sleep "$REFRESH_INTERVAL"
     done
+    
+    # 正常退出时释放锁
+    release_lock
 fi 

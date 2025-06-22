@@ -250,7 +250,7 @@ function uninstall_service() {
     fi
     
     if [ -n "$REMOTE_HOST" ]; then
-        local remote_script_path="/tmp/remote-sync-helper.sh"
+        local remote_script_path="/tmp/sync/remote-sync-helper.sh"
         echo "正在清理远程服务器脚本..."
         
         # 删除远程脚本

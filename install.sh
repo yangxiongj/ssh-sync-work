@@ -63,19 +63,11 @@ function init_remote_logging() {
     remote_setup_script=$(cat << 'REMOTE_SCRIPT'
 #!/bin/bash
 # 远程服务器日志环境初始化脚本
-LOG_DIR=""
+# 统一使用 /tmp/sync/ 目录
+LOG_DIR="/tmp/sync"
 
-# 确定远程日志目录
-if [ -w "/var/log" ] && [ "$EUID" -eq 0 ]; then
-    LOG_DIR="/var/log/sync-service"
-    mkdir -p "$LOG_DIR" 2>/dev/null
-else
-    LOG_DIR="$HOME/sync-logs"
-    mkdir -p "$LOG_DIR" 2>/dev/null || {
-        LOG_DIR="/tmp/sync-logs"
-        mkdir -p "$LOG_DIR"
-    }
-fi
+# 创建基础日志目录
+mkdir -p "$LOG_DIR" 2>/dev/null
 
 # 设置远程环境变量
 echo "export SYNC_LOG_DIR=\"$LOG_DIR\"" > ~/.sync-env
@@ -105,21 +97,9 @@ EOF
 
 chmod +x "$LOG_DIR/view-logs.sh"
 
-# 设置远程日志轮转
-if [ "$EUID" -eq 0 ]; then
-    cat > /etc/logrotate.d/sync-service << "EOF"
-/var/log/sync-service/*.log {
-    daily
-    missingok
-    rotate 7
-    compress
-    notifempty
-    create 644 root root
-}
-EOF
-else
-    (crontab -l 2>/dev/null; echo "0 2 * * * find $LOG_DIR -name \"*.log\" -size +10M -exec mv {} {}.old \\;") | crontab - 2>/dev/null
-fi
+# 设置远程日志自动清理
+# 使用 remote-sync-helper.sh 的清理功能
+(crontab -l 2>/dev/null; echo "0 2 * * * $LOG_DIR/remote-sync-helper.sh cleanup_logs 7 >/dev/null 2>&1") | crontab - 2>/dev/null
 
 echo "$LOG_DIR"
 REMOTE_SCRIPT
@@ -127,12 +107,8 @@ REMOTE_SCRIPT
     
     if echo "$remote_setup_script" | ssh_exec "$remote_host" "$remote_port" "cat > /tmp/init-remote-logging.sh && chmod +x /tmp/init-remote-logging.sh && /tmp/init-remote-logging.sh && rm -f /tmp/init-remote-logging.sh"; then
         local remote_log_dir=$(ssh_exec "$remote_host" "$remote_port" "
-            if [ -d /var/log/sync-service ]; then
-                echo '/var/log/sync-service'
-            elif [ -d ~/sync-logs ]; then
-                echo '~/sync-logs'
-            elif [ -d /tmp/sync-logs ]; then
-                echo '/tmp/sync-logs'
+            if [ -d /tmp/sync ]; then
+                echo '/tmp/sync'
             fi
         ")
         
@@ -358,7 +334,13 @@ function upload_remote_script() {
         return 1
     fi
     
-    local remote_script_path="/tmp/remote-sync-helper.sh"
+    local remote_script_path="/tmp/sync/remote-sync-helper.sh"
+    
+    # 确保远程目录存在
+    if ! ssh_exec "$remote_host" "$remote_port" "mkdir -p /tmp/sync"; then
+        output_install_status "ERROR" "创建远程目录失败"
+        return 1
+    fi
     
     if scp -P "$remote_port" "$REMOTE_HELPER_SCRIPT" "$remote_host:$remote_script_path" 2>/dev/null; then
         output_install_status "SUCCESS" "脚本上传"
@@ -504,10 +486,8 @@ EOF
     
     if [ -n "$REMOTE_HOST" ] && [ -n "$REMOTE_PORT" ]; then
         local remote_log_dir=$(ssh_exec "$REMOTE_HOST" "$REMOTE_PORT" "
-            if [ -d /var/log/sync-service ]; then
-                echo '/var/log/sync-service'
-            elif [ -d ~/sync-logs ]; then
-                echo '~/sync-logs'
+            if [ -d /tmp/sync ]; then
+                echo '/tmp/sync'
             fi
         " 2>/dev/null)
         
