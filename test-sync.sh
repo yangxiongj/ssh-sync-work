@@ -6,7 +6,7 @@
 # 默认参数
 TEST_DIR="${1:-/root/work/searxng}"
 KEEP_FILES="${2:-}"
-LOCAL_HASH="${3:-0d747837634b17ca0623888414dc842de9355604}"
+LOCAL_HASH="${3:-286760892be621333bde49539d34ea1316cd4ac9}"
 BRANCH_NAME="${4:-master}"
 EXCLUDE_PATTERNS="${5:-\.log$|\.tmp$}"
 
@@ -81,7 +81,7 @@ echo "$result" | while IFS= read -r line; do
             echo "  ✅ 哈希匹配: 本地和远程版本一致，无需同步"
             ;;
         "REMOTE_NEWER")
-            echo "  ⬆️  远程更新: 远程版本比本地新，保持远程版本"
+            echo "  🔄 远程重置: 远程版本比本地新，已重置到本地版本"
             ;;
         "PULLING_TO_LOCAL_HASH")
             echo "  ⬇️  拉取更新: 正在拉取到本地指定版本"

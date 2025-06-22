@@ -389,7 +389,7 @@ function update_remote_repository() {
             return 0  # 静默跳过，版本已同步
             ;;
         "REMOTE_NEWER")
-            echo -e "${YELLOW}[$dir_name] Remote version is newer${NC}"
+            echo -e "${CYAN}[$dir_name] Remote version reset to local version${NC}"
             ;;
         "PULLING_TO_LOCAL_HASH"|"BRANCH_DIVERGED_RESETTING"|"BRANCH_MISMATCH_SWITCHING")
             echo -e "${CYAN}[$dir_name] Updated to local version${NC}"

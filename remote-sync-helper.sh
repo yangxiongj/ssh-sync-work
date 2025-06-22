@@ -82,8 +82,9 @@ function smart_version_sync() {
     if [ "$remote_branch" = "$local_branch" ]; then
         # 分支一致，检查哈希关系
         if git merge-base --is-ancestor "$local_hash" "$remote_hash" 2>/dev/null; then
-            # 本地哈希是远程的祖先，远程更新（不需要操作）
+            # 本地哈希是远程的祖先，远程版本更新，需要重置到本地版本
             echo 'REMOTE_NEWER'
+            force_reset_to_hash "$local_hash"
         elif git merge-base --is-ancestor "$remote_hash" "$local_hash" 2>/dev/null; then
             # 远程哈希是本地的祖先，需要更新到本地哈希
             if git remote | grep -q origin; then
