@@ -13,6 +13,10 @@
 ✅ **详细的日志记录** - 完整的操作日志  
 ✅ **WSL路径支持** - 自动处理Windows到Linux路径映射  
 ✅ **行结束符处理** - 自动配置Git处理CRLF/LF转换，避免跨平台问题  
+✅ **配置热更新** - 配置文件支持热更新，无需重启服务  
+✅ **等待模式** - 当没有配置同步目录时自动进入等待模式  
+✅ **灵活配置文件** - 支持自定义配置文件路径  
+✅ **配置缓存管理** - 智能配置缓存，提升性能  
 
 ## 环境要求
 
@@ -28,8 +32,9 @@
 ### 核心脚本
 - `sync-files.sh` - 主同步脚本
 - `remote-sync-helper.sh` - 远程助手脚本
-- `sync-service.sh` - 服务管理脚本
-- `install.sh` - 一键安装脚本
+- `sync-service.sh` - 服务管理脚本，支持配置管理
+- `install.sh` - 一键安装脚本，支持自定义配置文件
+- `sync.yaml` - 默认配置文件
 
 ### 文档
 - `使用手册.md` - 完整的使用指南和故障排除
@@ -37,44 +42,75 @@
 - `技术实现文档.md` - 详细的技术实现细节
 
 ### 运行时文件
-- `service.log` - 服务运行日志
-- `service.pid` - 进程ID文件
+- `.sync-env` - 环境变量文件
+- `/tmp/sync_config_cache` - 配置缓存文件
 
 ## 快速开始
 
 ### 1. 配置同步参数
 
-编辑 `sync-files.sh` 中的配置：
+编辑 `sync.yaml` 配置文件：
 
-```bash
-# 基础配置
-REMOTE_HOST="127.0.0.1"                    # 远程服务器IP
-REMOTE_PORT="22"                           # SSH端口
-LOCAL_DIRS=(                               # 本地Git仓库目录列表 (WSL路径)
-    "/mnt/d/PycharmProjects/test" 
-)
-REMOTE_DIR="/root/work"                    # 远程目标目录
-REFRESH_INTERVAL=60                        # 同步间隔(秒)
+```yaml
+# 远程服务器配置
+remote:
+  host: 34.68.158.244
+  port: 22
+  dir: /root/work
+  os: ubuntu
 
-# Git配置
-AUTO_CRLF_CONFIG=true                      # 自动配置Git处理行结束符
+# 同步目录配置
+# 注意: 当此配置项被注释或为空时，服务将进入等待状态
+# 取消注释并添加至少一个目录路径后，服务将自动开始同步
+directories:
+- /mnt/d/PycharmProjects/test
+
+# 调试模式
+debug_mode: false
+
+# 刷新间隔 (秒)
+refresh_interval: 10
+
+# 配置更新检测间隔 (秒)
+config_check_interval: 10
+
+# 排除模式配置
+exclude_patterns:
+  - .git
+  - .idea
+  - __pycache__
+  - node_modules
+
+# 日志配置
+logs:
+  dir: /tmp/sync
+  max_days: 7
+  max_size: 10
 ```
 
 **重要说明：** 
-- 所有 `LOCAL_DIRS` 中的目录必须是Git仓库
+- 所有 `directories` 中的目录必须是Git仓库
 - 远程服务器上的对应目录也会被初始化为Git仓库
 - 只有包含未提交更改的仓库才会被同步
+- 配置文件支持热更新，修改后会在下一个检查周期自动加载
+- 当 `directories` 配置项被注释或为空时，服务将进入等待状态
+- 配置文件中的所有设置都以配置文件为最高优先级
 
 ### 2. 一键安装
 
-运行安装脚本：
-
+#### 使用默认配置文件安装：
 ```bash
 chmod +x install.sh
-./install.sh
+sudo ./install.sh
 ```
 
-### 3. 手动管理服务
+#### 使用自定义配置文件安装：
+```bash
+chmod +x install.sh
+sudo ./install.sh /path/to/your/sync.yaml
+```
+
+### 3. 服务管理
 
 ```bash
 # 安装开机自启服务 (需要sudo)
@@ -83,8 +119,14 @@ sudo ./sync-service.sh install
 # 启动服务
 ./sync-service.sh start
 
-# 查看服务状态
+# 查看服务状态和配置信息
 ./sync-service.sh status
+
+# 查看当前配置
+./sync-service.sh config
+
+# 刷新配置缓存
+./sync-service.sh refresh-config
 
 # 停止服务
 ./sync-service.sh stop
@@ -92,15 +134,31 @@ sudo ./sync-service.sh install
 # 重启服务
 ./sync-service.sh restart
 
-# 查看日志
-./sync-service.sh logs
-
-# 实时查看日志
+# 实时查看systemd日志
 ./sync-service.sh logs-f
 
 # 卸载服务 (需要sudo)
 sudo ./sync-service.sh uninstall
 ```
+
+### 4. 配置管理
+
+系统提供了强大的配置管理功能：
+
+#### 配置优先级
+1. **配置文件** (最高优先级)
+2. 环境变量
+3. 默认值
+
+#### 配置缓存
+- 系统会自动缓存配置以提升性能
+- 配置文件更新时会自动刷新缓存
+- 可以手动刷新配置缓存：`./sync-service.sh refresh-config`
+
+#### 配置验证
+- 启动服务时会自动验证配置文件
+- 提供详细的配置状态信息
+- 配置错误时会显示明确的错误信息
 
 ## Git增量同步工作原理
 
@@ -199,6 +257,23 @@ journalctl -u file-sync-service -f
 systemctl start file-sync-service
 systemctl stop file-sync-service
 ```
+
+### 配置热更新
+
+配置文件 `sync.yaml` 支持热更新，无需重启服务：
+
+1. 编辑 `sync.yaml` 文件
+2. 保存更改
+3. 系统会在下一个检查周期自动加载新配置（默认10秒）
+
+### 等待模式
+
+当 `directories` 配置项被注释或为空时，服务将进入等待模式：
+
+1. 服务会继续运行，但不会执行同步操作
+2. 日志中会显示 "等待配置目录更新" 的信息
+3. 服务状态会显示为 "等待配置"
+4. 取消注释并添加至少一个目录路径后，服务将自动开始同步
 
 ### 日志查看
 

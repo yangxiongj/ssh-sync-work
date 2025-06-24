@@ -1,9 +1,13 @@
 #!/bin/bash
+CONFIG_FILE="/mnt/d/sync.yaml" 
 
-# 导入配置
-source "./sync-files.sh" 2>/dev/null || {
-    echo "错误: 无法加载 sync-files.sh"
-    exit 1
+function ssh_exec() {
+    local host="$1"
+    local port="$2"
+    local command="$3"
+    local timeout="${4:-10}"
+
+    ssh -o ConnectTimeout="$timeout" -o BatchMode=yes "$host" -p "$port" "$command" 2>/dev/null
 }
 
 SCRIPT_DIR="$(pwd)"
@@ -132,16 +136,73 @@ REMOTE_SCRIPT
     return 1
 }
 
+# 创建本地日志目录
+function setup_local_logs() {
+    echo "创建本地日志目录..."
+    
+    # 创建基础日志目录
+    local base_log_dir="/tmp/sync"
+    mkdir -p "$base_log_dir" 2>/dev/null || {
+        output_install_status "ERROR" "创建本地日志目录"
+        echo "无法创建本地日志目录: $base_log_dir"
+        return 1
+    }
+    
+    # 创建默认日志目录
+    mkdir -p "$base_log_dir/default" 2>/dev/null
+    
+    # 创建基础日志文件
+    touch "$base_log_dir/default/sync-info.log" 2>/dev/null
+    touch "$base_log_dir/default/sync-error.log" 2>/dev/null
+    touch "$base_log_dir/default/sync-debug.log" 2>/dev/null
+    
+    # 为配置文件中的每个目录创建日志目录
+    if [ ${#LOCAL_DIRS[@]} -gt 0 ]; then
+        for local_dir in "${LOCAL_DIRS[@]}"; do
+            local dir_name=$(basename "$local_dir")
+            mkdir -p "$base_log_dir/$dir_name" 2>/dev/null
+            touch "$base_log_dir/$dir_name/sync-info.log" 2>/dev/null
+            touch "$base_log_dir/$dir_name/sync-error.log" 2>/dev/null
+            touch "$base_log_dir/$dir_name/sync-debug.log" 2>/dev/null
+            echo "创建目录日志: $dir_name"
+        done
+    fi
+    
+    # 设置权限
+    if [ -n "$SUDO_USER" ]; then
+        chown -R "$SUDO_USER:$SUDO_USER" "$base_log_dir" 2>/dev/null
+    fi
+    
+    output_install_status "SUCCESS" "本地日志目录"
+    echo "本地日志目录: $base_log_dir"
+    return 0
+}
+
 # 设置本地环境变量（不需要本地日志文件）
 function setup_local_environment() {
     echo "设置本地环境变量..."
     
     # 本地客户端是轻量级调度器，不需要详细日志
     local env_file="$SCRIPT_DIR/.sync-env"
-    # 环境变量文件已经在 init_remote_logging 中创建，这里不需要额外操作
+    
+    # 设置配置文件路径环境变量
+    echo "使用配置文件: $CONFIG_FILE"
+    echo "export CONFIG_FILE=\"$CONFIG_FILE\"" > "$env_file"
+    
+    # 如果有远程主机信息，添加到环境变量文件
+    if [ -n "$REMOTE_HOST" ]; then
+        echo "export REMOTE_HOST=\"$REMOTE_HOST\"" >> "$env_file"
+        echo "export REMOTE_PORT=\"$REMOTE_PORT\"" >> "$env_file"
+        echo "export REMOTE_DIR=\"$REMOTE_DIR\"" >> "$env_file"
+        echo "export REMOTE_OS=\"$REMOTE_OS\"" >> "$env_file"
+    fi
+    
+    # 确保环境变量文件可执行
+    chmod +x "$env_file" 2>/dev/null || true
     
     output_install_status "SUCCESS" "本地环境设置"
     echo "本地客户端配置为轻量级调度器模式"
+    echo "配置文件路径已保存到: $env_file"
 }
 
 # 检查必要文件
@@ -362,11 +423,61 @@ function upload_remote_script() {
 function install_file_sync_service() {
     echo "开始安装文件同步服务..."
     
-    # 步骤1: 加载配置
+    # 步骤1: 检查配置文件
     echo ""
-    echo "步骤1: 加载配置文件"
-    if ! load_cached_config; then
-        load_config
+    echo "步骤1: 检查配置文件"
+    
+    # 检查配置文件位置
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "使用配置文件: $CONFIG_FILE (通过参数指定)"
+        # 设置配置文件路径环境变量
+        export CONFIG_FILE
+    else
+        echo "错误: 未找到配置文件 $CONFIG_FILE"
+        echo "请确保配置文件存在，或使用不同的配置文件路径"
+        echo "用法: $0 [CONFIG_FILE_PATH]"
+        exit 1
+    fi
+    
+    # 从配置文件加载远程主机信息
+    echo ""
+    echo "步骤1.1: 加载远程主机配置"
+    # 使用yq解析YAML配置文件
+    if command -v yq >/dev/null 2>&1; then
+        local remote_host=$(yq eval '.remote.host' "$CONFIG_FILE" 2>/dev/null)
+        local remote_port=$(yq eval '.remote.port' "$CONFIG_FILE" 2>/dev/null)
+        local remote_dir=$(yq eval '.remote.dir' "$CONFIG_FILE" 2>/dev/null)
+        local remote_os=$(yq eval '.remote.os' "$CONFIG_FILE" 2>/dev/null)
+        
+        # 如果无法解析，使用grep作为备选方案
+        if [ -z "$remote_host" ] || [ "$remote_host" = "null" ]; then
+            remote_host=$(grep -A 10 "remote:" "$CONFIG_FILE" | grep "host:" | head -1 | sed 's/.*host:[[:space:]]*//;s/["'\'']*//g')
+            remote_port=$(grep -A 10 "remote:" "$CONFIG_FILE" | grep "port:" | head -1 | sed 's/.*port:[[:space:]]*//;s/["'\'']*//g')
+            remote_dir=$(grep -A 10 "remote:" "$CONFIG_FILE" | grep "dir:" | head -1 | sed 's/.*dir:[[:space:]]*//;s/["'\'']*//g')
+            remote_os=$(grep -A 10 "remote:" "$CONFIG_FILE" | grep "os:" | head -1 | sed 's/.*os:[[:space:]]*//;s/["'\'']*//g')
+        fi
+        
+        # 设置默认值
+        [ -z "$remote_port" ] || [ "$remote_port" = "null" ] && remote_port="22"
+        [ -z "$remote_os" ] || [ "$remote_os" = "null" ] && remote_os="ubuntu"
+        
+        if [ -n "$remote_host" ] && [ "$remote_host" != "null" ]; then
+            echo "远程主机: $remote_host:$remote_port"
+            echo "远程目录: $remote_dir"
+            echo "远程系统: $remote_os"
+            
+            # 设置环境变量
+            export REMOTE_HOST="$remote_host"
+            export REMOTE_PORT="$remote_port"
+            export REMOTE_DIR="$remote_dir"
+            export REMOTE_OS="$remote_os"
+        else
+            echo "警告: 无法从配置文件获取远程主机信息"
+            echo "将跳过远程主机相关操作"
+        fi
+    else
+        echo "警告: 未安装yq工具，无法解析YAML配置"
+        echo "将跳过远程主机相关操作"
     fi
     
     # 步骤2: 初始化远程日志环境
@@ -382,6 +493,11 @@ function install_file_sync_service() {
     echo ""
     echo "步骤3: 设置本地环境"
     setup_local_environment
+    
+    # 步骤3.1: 创建本地日志目录
+    echo ""
+    echo "步骤3.1: 创建本地日志目录"
+    setup_local_logs
     
     # 步骤4: 检查远程工具
     echo ""
@@ -424,14 +540,17 @@ Type=simple
 User=$SUDO_USER
 Group=$SUDO_USER
 WorkingDirectory=$SCRIPT_DIR
+Environment="CONFIG_FILE=$CONFIG_FILE"
 ExecStartPre=/bin/bash -c 'source $SCRIPT_DIR/.sync-env 2>/dev/null || true'
-ExecStart=/bin/bash -c 'source $SCRIPT_DIR/.sync-env 2>/dev/null; $SCRIPT_DIR/sync-files.sh'
+ExecStart=/bin/bash -c 'export CONFIG_FILE="$CONFIG_FILE"; source $SCRIPT_DIR/.sync-env 2>/dev/null; source $SCRIPT_DIR/sync-service.sh 2>/dev/null; $SCRIPT_DIR/sync-files.sh'
 Restart=always
 RestartSec=30
 StandardOutput=null
 StandardError=journal
 KillMode=process
 TimeoutStopSec=60
+# 配置文件更新监控
+ExecReload=/bin/bash -c 'export CONFIG_FILE="$CONFIG_FILE"; source $SCRIPT_DIR/.sync-env 2>/dev/null; source $SCRIPT_DIR/sync-service.sh 2>/dev/null; $SCRIPT_DIR/sync-service.sh restart'
 
 [Install]
 WantedBy=multi-user.target
@@ -513,12 +632,17 @@ EOF
 # 主执行逻辑
 function main() {
     echo "=== 文件同步服务安装程序 ==="
+    echo "配置文件: $CONFIG_FILE"
     echo ""
     
     # 检查sudo权限
     if [ "$EUID" -ne 0 ]; then
         echo "请使用sudo权限运行此脚本"
-        echo "使用: sudo $0"
+        echo "使用: sudo $0 [CONFIG_FILE]"
+        echo ""
+        echo "示例:"
+        echo "  sudo $0                        # 使用默认配置文件"
+        echo "  sudo $0 /path/to/sync.yaml     # 使用指定配置文件"
         exit 1
     fi
     

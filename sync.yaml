@@ -3,14 +3,29 @@ remote:
   host: 34.68.158.244
   port: 22
   dir: /root/work
-  os: ubuntu  # 远程操作系统类型: ubuntu, centos, debian, alpine 等
 
 # 同步目录配置
+# 注意: 当此配置项被注释或为空时，服务将进入等待状态
+# 取消注释并添加至少一个目录路径后，服务将自动开始同步
+# 格式: - /path/to/directory
 directories:
-  # - /mnt/d/PycharmProjects/test
+#- /mnt/d/PycharmProjects/test
+
+#调试模式
+debug_mode: true
+
+# 日志配置
+logs:
+  dir: /tmp/sync  # 日志目录
+  max_days: 7        # 日志保留天数
+  max_size: 10       # 日志文件最大大小（MB）
 
 # 刷新间隔 (秒)
 refresh_interval: 10
+
+# 配置更新检测间隔 (秒)
+# 此配置控制多久检查一次配置文件是否有更新
+config_check_interval: 10
 
 # 排除模式配置
 exclude_patterns:
@@ -18,3 +33,6 @@ exclude_patterns:
   - .idea
   - __pycache__
   # 更多模式...
+
+# 注意: 此配置文件支持热更新，修改后会在下一个刷新周期自动加载
+# 无需重启服务即可应用新配置
