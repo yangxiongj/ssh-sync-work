@@ -410,11 +410,11 @@ function sync_version() {
     # 分支匹配检查
     if [ "$remote_branch" = "$local_branch" ]; then
         write_log "INFO" "分支匹配，重置到目标版本" "SYNC"
-        reset_to_target_hash "$local_hash" "$target_dir"
+        simple_reset_to_hash "$target_dir"
     else
         write_log "INFO" "分支不匹配: $remote_branch -> $local_branch，切换分支" "SYNC"
         echo 'BRANCH_MISMATCH_SWITCHING'
-        reset_to_target_hash "$local_hash" "$target_dir"
+        simple_reset_to_hash "$target_dir"
     fi
     
     # 处理文件删除
@@ -525,111 +525,23 @@ function process_working_changes() {
     handle_file_deletions "$files_to_keep"
 }
 
-# 重置到目标哈希
-function reset_to_target_hash() {
-    local target_hash="$1"
-    local target_dir="$2"
-    
-    write_log "INFO" "开始重置到 ${target_hash:0:8}" "RESET"
-    
-    # 尝试简单重置
-    if git reset --hard "$target_hash" 2>/dev/null; then
-        write_log "INFO" "重置成功到 ${target_hash:0:8}" "RESET"
-        return 0
-    fi
-    
-    write_log "WARN" "简单重置失败，尝试复杂清理" "RESET"
-    
-    # 清理Git状态
-    git merge --abort 2>/dev/null || true
-    git rebase --abort 2>/dev/null || true
-    git cherry-pick --abort 2>/dev/null || true
-    git reset HEAD . 2>/dev/null || true
-    git checkout --force . 2>/dev/null || true
-    git clean -fdx 2>/dev/null || true
-    
-    # 再次尝试重置
-    if git reset --hard "$target_hash" 2>/dev/null; then
-        write_log "INFO" "复杂重置成功到 ${target_hash:0:8}" "RESET"
-        return 0
-    fi
-    
-    # 最后手段：激进重置
-    write_log "WARN" "复杂重置失败，尝试激进重置" "RESET"
-    rm -f .git/index 2>/dev/null || true
-    
-    if git checkout --force "$target_hash" 2>/dev/null; then
-        # 确保在分支上
-        local current_branch=$(git branch --show-current 2>/dev/null)
-        if [ -z "$current_branch" ]; then
-            git checkout -B main "$target_hash" 2>/dev/null || true
-        fi
-        write_log "INFO" "激进重置成功到 ${target_hash:0:8}" "RESET"
-        return 0
-    fi
-    
-    # 重置失败
-    write_log "ERROR" "重置失败到 ${target_hash:0:8}" "RESET"
-    log_detailed_status_on_error "$target_dir" "重置失败"
-    echo 'RESET_FAILED'
-    return 1
-}
 
-# 简单重置到指定哈希（性能优化版本）
+# 重置到指定哈希（性能优化版本）
 function simple_reset_to_hash() {
     local target_hash="$1"
 
     # 最简单的重置尝试，完全不保留工作区文件
     if git reset --hard "$target_hash" 2>/dev/null; then
+        write_log "INFO" "重置成功到 ${target_hash:0:8}" "RESET"
         return 0
+    elif git fetch 2>/dev/null; then
+        if  git reset --hard "$target_hash" 2>/dev/null; then
+            write_log "INFO" "重置成功到 ${target_hash:0:8}" "RESET"
+            return 0
+        fi
     fi
 
     # 失败则返回，让调用者决定是否进行复杂处理
-    return 1
-}
-
-# 强制重置到指定哈希（异常处理版本）
-function force_reset_to_hash() {
-    local target_hash="$1"
-
-    write_log "INFO" "开始强制重置到 ${target_hash:0:8}" "RESET"
-
-    # 首先尝试简单重置
-    if simple_reset_to_hash "$target_hash"; then
-        write_log "INFO" "简单重置成功到 ${target_hash:0:8}" "RESET"
-        return 0
-    fi
-
-    write_log "WARN" "简单重置失败，进行复杂清理" "RESET"
-
-    # 清理Git状态（仅在异常时执行）
-    git merge --abort 2>/dev/null || true
-    git rebase --abort 2>/dev/null || true
-    git cherry-pick --abort 2>/dev/null || true
-    git reset HEAD . 2>/dev/null || true
-    git checkout --force . 2>/dev/null || true
-    git clean -fdx 2>/dev/null || true
-
-    # 尝试标准重置
-    if git reset --hard "$target_hash" 2>/dev/null; then
-        write_log "INFO" "标准重置成功到 ${target_hash:0:8}" "RESET"
-        return 0
-    fi
-
-    write_log "WARN" "标准重置失败，尝试激进重置" "RESET"
-
-    # 激进重置（最后手段）
-    rm -f .git/index 2>/dev/null || true
-    if git checkout --force "$target_hash" 2>/dev/null; then
-        local current_branch=$(git branch --show-current 2>/dev/null)
-        if [ -z "$current_branch" ]; then
-            git checkout -B main "$target_hash" 2>/dev/null || true
-        fi
-        write_log "INFO" "激进重置成功到 ${target_hash:0:8}" "RESET"
-        return 0
-    fi
-
-    write_log "ERROR" "重置失败到 ${target_hash:0:8}" "RESET"
     return 1
 }
 

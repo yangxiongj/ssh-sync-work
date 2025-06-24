@@ -187,14 +187,9 @@ function stop_service() {
     
     log_service "INFO" "停止文件同步服务"
     
-    # 尝试从配置缓存获取远程配置信息以便清理
-    local remote_host="$REMOTE_HOST"
-    local remote_port="$REMOTE_PORT"
-    
     systemctl stop "$SERVICE_NAME"
     
-    log_service "ERROR" "服务停止失败"
-    return 1
+    return 0
 }
 
 # 重启服务
