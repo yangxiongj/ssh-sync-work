@@ -191,13 +191,7 @@ function stop_service() {
     local remote_host="$REMOTE_HOST"
     local remote_port="$REMOTE_PORT"
     
-    if systemctl stop "$SERVICE_NAME" 2>/dev/null; then
-        if [ -n "$remote_host" ] && [ -n "$remote_port" ]; then
-            cleanup_remote "$remote_host" "$remote_port"
-        fi
-        log_service "SUCCESS" "服务已停止"
-        return 0
-    fi
+    systemctl stop "$SERVICE_NAME"
     
     log_service "ERROR" "服务停止失败"
     return 1
@@ -249,18 +243,9 @@ function uninstall_service() {
         rm -f "$SERVICE_FILE"
         log_service "SUCCESS" "已删除服务文件: $SERVICE_FILE"
     fi
-    
-    echo "步骤5: 清理远程服务器脚本"
-    if [ -n "$REMOTE_HOST" ]; then
-        local remote_script_path="/tmp/sync/remote-sync-helper.sh"
-        echo "正在清理远程服务器脚本..."
-        if ssh "$REMOTE_HOST" -p "$REMOTE_PORT" "rm -rf /tmp/sync/* 2>/dev/null || rm -rf ~/sync-logs 2>/dev/null" 2>/dev/null; then
-            log_service "SUCCESS" "已清理远程日志目录"
-        fi
-    else
-        log_service "WARNING" "跳过远程脚本清理（无有效配置）"
-    fi
-    
+    #清除远程服务器脚本
+    cleanup_remote "$REMOTE_HOST" "$REMOTE_PORT"
+
     # 步骤5: 清理本地缓存
     echo "步骤5: 清理本地缓存文件"
     
