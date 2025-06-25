@@ -278,10 +278,10 @@ function install_service() {
     if [ "$EUID" -ne 0 ]; then
         echo "需要sudo权限来安装系统服务"
         echo "正在调用: sudo $install_script \"$CONFIG_FILE\""
-        exec sudo "$install_script" "$CONFIG_FILE"
+        sudo "$install_script" "$CONFIG_FILE"
     else
         # 已经是root权限，直接执行
-        exec "$install_script" "$CONFIG_FILE"
+        "$install_script" "$CONFIG_FILE"
     fi
 }
 

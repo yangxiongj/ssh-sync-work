@@ -1,5 +1,5 @@
 #!/bin/bash
-CONFIG_FILE="/mnt/d/sync.yaml" 
+CONFIG_FILE="$1"
 
 function ssh_exec() {
     local host="$1"
