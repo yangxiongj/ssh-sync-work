@@ -17,7 +17,7 @@ debug_mode: true
 # 日志配置
 logs:
   dir: /tmp/sync  # 日志目录
-  max_days: 7        # 日志保留天数
+  max_days: 7
   max_size: 10       # 日志文件最大大小（MB）
 
 # 刷新间隔 (秒)

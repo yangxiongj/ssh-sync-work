@@ -247,7 +247,7 @@ function uninstall_service() {
     # 删除配置缓存文件
     rm -f "$SCRIPT_DIR/.sync_cache" 2>/dev/null && log_service "SUCCESS" "已删除配置缓存"
     rm -f "$SCRIPT_DIR/.sync-env" 2>/dev/null && log_service "SUCCESS" "已删除环境变量文件"
-    
+    rm -f .sync-env
     # 步骤6: 重新加载systemd配置
     echo "步骤6: 重新加载systemd配置"
     systemctl daemon-reload

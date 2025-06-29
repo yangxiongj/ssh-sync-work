@@ -4,15 +4,10 @@
 if [ -f "$(dirname "$0")/.sync-env" ]; then
     source "$(dirname "$0")/.sync-env"
 fi
-
+CONFIG_FILE="/mnt/d/sync.yaml"
 # 本地客户端不需要详细日志，只在远程服务器记录
 
-# 导入YAML解析库
-if ! command -v yq >/dev/null 2>&1; then
-    echo "错误: 需要安装 yq 工具来解析YAML配置"
-    echo "安装命令: sudo apt install yq 或 sudo yum install yq"
-    exit 1
-fi
+# yq工具检查已移到load_config函数中进行
 
 # 防止重复加载配置函数
 if [ -n "$SYNC_CONFIG_LOADED" ]; then
@@ -259,13 +254,9 @@ function ssh_exec_fast() {
     local port="$2"
     local command="$3"
 
-    if [ "$PERFORMANCE_MODE" = "true" ]; then
-        ssh -o ControlMaster=no -o ControlPath="$SSH_CONTROL_PATH" \
+    ssh -o ControlMaster=no -o ControlPath="$SSH_CONTROL_PATH" \
             -o ConnectTimeout=5 -o ServerAliveInterval=30 \
             -p "$port" "$host" "$command"
-    else
-        ssh_exec "$host" "$port" "$command"
-    fi
 }
 
 # 统一的状态输出函数
@@ -294,94 +285,119 @@ function load_config() {
     fi
     log_info "检测到配置文件已更新，重新加载配置" "CONFIG"
     
+    # 清空配置数组
     LOCAL_DIRS=()
     EXCLUDE_PATTERNS=()
-
-    # 简化的YAML解析
-    local in_directories=false
-    local in_exclude=false
-    local in_remote=false
-    local in_logs=false
-    echo "$CONFIG_FILE"
-    while IFS= read -r line; do
-        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-        echo "$line"
-        case "$line" in
-            "remote:")
-                in_remote=true; in_directories=false; in_exclude=false; in_logs=false ;;
-            "directories:")
-                in_directories=true; in_remote=false; in_exclude=false; in_logs=false;;
-            "exclude_patterns:")
-                in_exclude=true; in_remote=false; in_directories=false; in_logs=false;;
-            "logs:")
-                in_logs=true; in_remote=false; in_directories=false; in_exclude=false ;;
-            "refresh_interval:"*)
-                REFRESH_INTERVAL=$(echo "$line" | sed 's/.*:[[:space:]]*//;s/["'\'']*//g')
-                in_remote=false; in_directories=false; in_exclude=false; in_logs=false ;;
-            "config_check_interval:"*)
-                CONFIG_CHECK_INTERVAL=$(echo "$line" | sed 's/.*:[[:space:]]*//;s/["'\'']*//g')
-                in_remote=false; in_directories=false; in_exclude=false; in_logs=false ;;
-            "debug_mode:"*)
-                local debug_value=$(echo "$line" | sed 's/.*:[[:space:]]*//;s/["'\'']*//g')
-                if [ "$debug_value" = "true" ]; then
-                    DEBUG_MODE="true"
-                else
-                    DEBUG_MODE="false"
-                fi
-                in_remote=false; in_directories=false; in_exclude=false; in_logs=false ;;
-            *":"*)
-                in_remote=false; in_directories=false; in_exclude=false; in_logs=false ;;
-        esac
-
-        if [ "$in_remote" = true ] && [[ "$line" =~ ^[a-z]+:[[:space:]]*.+ ]]; then
-            local key=$(echo "$line" | cut -d: -f1)
-            local value=$(echo "$line" | sed 's/.*:[[:space:]]*//;s/["'\'']*//g')
-            case "$key" in
-                # 配置文件优先，直接覆盖环境变量（包括空值）
-                "host") REMOTE_HOST="$value" ;;
-                "port") REMOTE_PORT="$value" ;;
-                "dir") REMOTE_DIR="$value" ;;
-                "os") REMOTE_OS="$value" ;;
-            esac
-        elif [ "$in_remote" = true ] && [[ "$line" =~ ^[a-z]+:[[:space:]]*$ ]]; then
-            # 处理空值的remote配置（如 "host:" 后面没有值）
-            local key=$(echo "$line" | cut -d: -f1)
-            case "$key" in
-                "host") REMOTE_HOST="" ;;
-                "port") REMOTE_PORT="" ;;
-                "dir") REMOTE_DIR="" ;;
-                "os") REMOTE_OS="" ;;
-            esac
-        elif [ "$in_directories" = true ] && [[ "$line" =~ ^-[[:space:]]+ ]]; then
-            local dir_path=$(echo "$line" | sed 's/^-[[:space:]]*//;s/["'\'']*//g')
-            # 即使是空值也添加到数组中，保持配置文件的完整性
-            LOCAL_DIRS+=("$dir_path")
-        elif [ "$in_exclude" = true ] && [[ "$line" =~ ^-[[:space:]]+ ]]; then
-            local pattern=$(echo "$line" | sed 's/^-[[:space:]]*//;s/["'\'']*//g')
-            # 即使是空值也添加到数组中，保持配置文件的完整性
-            EXCLUDE_PATTERNS+=("$pattern")
-        elif [ "$in_logs" = true ] && [[ "$line" =~ ^[a-z_]+:[[:space:]]*.+ ]]; then
-            local key=$(echo "$line" | cut -d: -f1)
-            local value=$(echo "$line" | sed 's/.*:[[:space:]]*//;s/["'\'']*//g')
-            case "$key" in
-                "dir") 
-                    # 展开~为$HOME
-                    if [[ "$value" == "~"* ]]; then
-                        value="${value/#\~/$HOME}"
-                    fi
-                    LOG_DIR="$value" 
-                    # 更新日志文件路径
-                    INFO_LOG="${LOG_DIR}/sync-info.log"
-                    ERROR_LOG="${LOG_DIR}/sync-error.log"
-                    DEBUG_LOG="${LOG_DIR}/sync-debug.log"
-                    ;;
-                "max_days") LOG_MAX_DAYS="$value" ;;
-                "max_size") LOG_MAX_SIZE="$value" ;;
-            esac
-        fi
-    done < "$CONFIG_FILE"
-
+    
+    # 检查yq工具是否可用
+    if ! command -v yq >/dev/null 2>&1; then
+        log_error "未安装yq工具，无法解析YAML配置文件" "CONFIG"
+        echo "错误: 需要安装 yq 工具来解析YAML配置"
+        echo "安装命令: sudo apt install yq 或 sudo yum install yq"
+        return 1
+    fi
+    
+    log_debug "使用yq解析配置文件: $CONFIG_FILE" "CONFIG"
+    
+    # 1. 读取remote配置
+    log_debug "读取remote配置" "CONFIG"
+    local remote_host=$(yq eval '.remote.host // ""' "$CONFIG_FILE" 2>/dev/null)
+    local remote_port=$(yq eval '.remote.port // "22"' "$CONFIG_FILE" 2>/dev/null)
+    local remote_dir=$(yq eval '.remote.dir // ""' "$CONFIG_FILE" 2>/dev/null)
+    local remote_os=$(yq eval '.remote.os // "ubuntu"' "$CONFIG_FILE" 2>/dev/null)
+    
+    # 处理null值和空值
+    [ "$remote_host" = "null" ] && remote_host=""
+    [ "$remote_port" = "null" ] && remote_port="22"
+    [ "$remote_dir" = "null" ] && remote_dir=""
+    [ "$remote_os" = "null" ] && remote_os="ubuntu"
+    
+    # 设置remote配置变量
+    REMOTE_HOST="$remote_host"
+    REMOTE_PORT="$remote_port"
+    REMOTE_DIR="$remote_dir"
+    REMOTE_OS="$remote_os"
+    
+    log_debug "Remote配置: host=$REMOTE_HOST, port=$REMOTE_PORT, dir=$REMOTE_DIR, os=$REMOTE_OS" "CONFIG"
+    
+    # 2. 读取directories配置（数组）
+    log_debug "读取directories配置" "CONFIG"
+    local directories_length=$(yq eval '.directories | length' "$CONFIG_FILE" 2>/dev/null)
+    if [ "$directories_length" != "null" ] && [ "$directories_length" -gt 0 ]; then
+        for ((i=0; i<directories_length; i++)); do
+            local dir_path=$(yq eval ".directories[$i]" "$CONFIG_FILE" 2>/dev/null)
+            if [ "$dir_path" != "null" ] && [ -n "$dir_path" ]; then
+                LOCAL_DIRS+=("$dir_path")
+                log_debug "添加同步目录: $dir_path" "CONFIG"
+            fi
+        done
+    else
+        log_debug "未配置directories或为空" "CONFIG"
+    fi
+    
+    # 3. 读取exclude_patterns配置（数组）
+    log_debug "读取exclude_patterns配置" "CONFIG"
+    local exclude_length=$(yq eval '.exclude_patterns | length' "$CONFIG_FILE" 2>/dev/null)
+    if [ "$exclude_length" != "null" ] && [ "$exclude_length" -gt 0 ]; then
+        for ((i=0; i<exclude_length; i++)); do
+            local pattern=$(yq eval ".exclude_patterns[$i]" "$CONFIG_FILE" 2>/dev/null)
+            if [ "$pattern" != "null" ] && [ -n "$pattern" ]; then
+                EXCLUDE_PATTERNS+=("$pattern")
+                log_debug "添加排除模式: $pattern" "CONFIG"
+            fi
+        done
+    else
+        log_debug "未配置exclude_patterns或为空" "CONFIG"
+    fi
+    
+    # 4. 读取基本配置项
+    log_debug "读取基本配置项" "CONFIG"
+    local refresh_interval=$(yq eval '.refresh_interval // "30"' "$CONFIG_FILE" 2>/dev/null)
+    local config_check_interval=$(yq eval '.config_check_interval // "10"' "$CONFIG_FILE" 2>/dev/null)
+    local debug_mode=$(yq eval '.debug_mode // "false"' "$CONFIG_FILE" 2>/dev/null)
+    
+    # 处理null值
+    [ "$refresh_interval" = "null" ] && refresh_interval="30"
+    [ "$config_check_interval" = "null" ] && config_check_interval="10"
+    [ "$debug_mode" = "null" ] && debug_mode="false"
+    
+    # 设置配置变量
+    REFRESH_INTERVAL="$refresh_interval"
+    CONFIG_CHECK_INTERVAL="$config_check_interval"
+    DEBUG_MODE="$debug_mode"
+    
+    # 5. 读取logs配置
+    log_debug "读取logs配置" "CONFIG"
+    local log_dir=$(yq eval '.logs.dir // ""' "$CONFIG_FILE" 2>/dev/null)
+    local log_max_days=$(yq eval '.logs.max_days // "7"' "$CONFIG_FILE" 2>/dev/null)
+    local log_max_size=$(yq eval '.logs.max_size // "10"' "$CONFIG_FILE" 2>/dev/null)
+    
+    # 处理null值和路径展开
+    [ "$log_dir" = "null" ] && log_dir=""
+    [ "$log_max_days" = "null" ] && log_max_days="7"
+    [ "$log_max_size" = "null" ] && log_max_size="10"
+    
+    # 展开~为$HOME
+    if [ -n "$log_dir" ] && [[ "$log_dir" == "~"* ]]; then
+        log_dir="${log_dir/#\~/$HOME}"
+    fi
+    
+    # 设置日志配置变量
+    if [ -n "$log_dir" ]; then
+        LOG_DIR="$log_dir"
+        # 更新日志文件路径
+        INFO_LOG="${LOG_DIR}/sync-info.log"
+        ERROR_LOG="${LOG_DIR}/sync-error.log"
+        DEBUG_LOG="${LOG_DIR}/sync-debug.log"
+    fi
+    LOG_MAX_DAYS="$log_max_days"
+    LOG_MAX_SIZE="$log_max_size"
+    
+    log_debug "日志配置: dir=$LOG_DIR, max_days=$LOG_MAX_DAYS, max_size=$LOG_MAX_SIZE" "CONFIG"
+    
+    # 输出配置摘要
+    log_info "配置加载完成: remote=${REMOTE_HOST}:${REMOTE_PORT}, directories=${#LOCAL_DIRS[@]}个, excludes=${#EXCLUDE_PATTERNS[@]}个" "CONFIG"
+    
     save_config_cache
 }
 

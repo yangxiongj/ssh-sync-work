@@ -448,15 +448,7 @@ function install_file_sync_service() {
         local remote_port=$(yq eval '.remote.port' "$CONFIG_FILE" 2>/dev/null)
         local remote_dir=$(yq eval '.remote.dir' "$CONFIG_FILE" 2>/dev/null)
         local remote_os=$(yq eval '.remote.os' "$CONFIG_FILE" 2>/dev/null)
-        
-        # 如果无法解析，使用grep作为备选方案
-        if [ -z "$remote_host" ] || [ "$remote_host" = "null" ]; then
-            remote_host=$(grep -A 10 "remote:" "$CONFIG_FILE" | grep "host:" | head -1 | sed 's/.*host:[[:space:]]*//;s/["'\'']*//g')
-            remote_port=$(grep -A 10 "remote:" "$CONFIG_FILE" | grep "port:" | head -1 | sed 's/.*port:[[:space:]]*//;s/["'\'']*//g')
-            remote_dir=$(grep -A 10 "remote:" "$CONFIG_FILE" | grep "dir:" | head -1 | sed 's/.*dir:[[:space:]]*//;s/["'\'']*//g')
-            remote_os=$(grep -A 10 "remote:" "$CONFIG_FILE" | grep "os:" | head -1 | sed 's/.*os:[[:space:]]*//;s/["'\'']*//g')
-        fi
-        
+
         # 设置默认值
         [ -z "$remote_port" ] || [ "$remote_port" = "null" ] && remote_port="22"
         [ -z "$remote_os" ] || [ "$remote_os" = "null" ] && remote_os="ubuntu"
