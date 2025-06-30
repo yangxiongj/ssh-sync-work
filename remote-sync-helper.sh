@@ -58,8 +58,11 @@ function fetch_git_info_once() {
     cd "$target_dir" 2>/dev/null || return 1
 
     # 使用git status v2格式一次性获取所有信息
-    local git_status_v2=$(git status --porcelain=v2 -b 2>/dev/null)
-
+    local git_status_v2=$(git status --porcelain=v2 -b 2>&1)
+    if echo "$git_status_v2" | grep -q "fatal: detected dubious ownership"; then
+        git config --global --add safe.directory "$target_dir"
+        git_status_v2=$(git status --porcelain=v2 -b 2>/dev/null)
+    fi
     # 提取分支信息
     GIT_BRANCH_CACHE=$(echo "$git_status_v2" | grep "^# branch.head " | cut -d' ' -f3)
     [ -z "$GIT_BRANCH_CACHE" ] && GIT_BRANCH_CACHE="unknown"

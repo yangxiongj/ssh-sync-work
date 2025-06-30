@@ -478,8 +478,12 @@ function detect_file_changes_fast() {
     cd "$local_dir" 2>/dev/null || return 1
 
     # 一次性获取所有Git状态信息
-    local git_status_output=$(git status --porcelain=v1 2>/dev/null)
-
+    local git_status_output=$(git status --porcelain=v1 2>&1)
+    # 检查是否有 dubious ownership 错误
+    if echo "$git_status_output" | grep -q "fatal: detected dubious ownership"; then
+        git config --global --add safe.directory "$local_dir"
+        git_status_output=$(git status --porcelain=v1 2>/dev/null)
+    fi
     # 解析git status输出，比多次调用git diff更快
     local modified_files=""
     local staged_files=""
