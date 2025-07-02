@@ -553,28 +553,6 @@ function detect_file_changes_fast() {
 
     # 合并所有文件变更
     local all_files="$modified_files"$'\n'"$staged_files"$'\n'"$untracked_files"$'\n'"$unpushed_files"$'\n'"$deleted_files_with_prefix"
-    # 调试：打印各个文件变更类型的值
-    if [ "$DEBUG_MODE" = "true" ]; then
-        echo "=== 文件变更检测调试信息 ==="
-        echo "modified_files:"
-        echo "$modified_files"
-        echo "---"
-        echo "staged_files:"
-        echo "$staged_files"
-        echo "---"
-        echo "untracked_files:"
-        echo "$untracked_files"
-        echo "---"
-        echo "unpushed_files:"
-        echo "$unpushed_files"
-        echo "---"
-        echo "deleted_files_with_prefix:"
-        echo "$deleted_files_with_prefix"
-        echo "---"
-        echo "all_files (合并后):"
-        echo "$all_files"
-        echo "========================="
-    fi
 
     local unique_files=$(echo "$all_files" | grep -v '^$' | sort -u)
 
@@ -789,16 +767,7 @@ function sync_files() {
         log_info "检测文件变更: $dir_name" "SYNC_DIR"
         local unique_files
         unique_files=$(detect_file_changes_fast "$local_dir")
-        # 调试：打印unique_files的内容
-        if [ -n "$unique_files" ]; then
-            log_info "unique_files内容:" "SYNC_DEBUG"
-            echo "=== unique_files 内容 ==="
-            echo "$unique_files"
-            echo "========================="
-        else
-            log_info "unique_files为空" "SYNC_DEBUG"
-            echo "unique_files为空"
-        fi
+
         local deleted_files_with_prefix=""
         if [ -n "$deleted_files" ]; then
             deleted_files_with_prefix=$(echo "$deleted_files" | sed 's/^/DEL:/')
@@ -815,17 +784,11 @@ function sync_files() {
         # 正确计算文件数量
         local file_count=0
         if [ -n "$unique_files" ]; then
-            file_count=$(echo "$unique_files" | wc -l)
+            file_count=$(echo "$unique_files" | grep -c '^.')
         fi
-        
-        log_info "检测到 $file_count 个文件需要同步" "SYNC_DIR"
 
         # 性能模式下减少输出
-        if [ "$PERFORMANCE_MODE" = "true" ]; then
-            [ "$file_count" -gt 0 ] && echo "[$dir_name] 同步 $file_count 个文件"
-        else
-            echo "[$dir_name] 需要同步 $file_count 个文件"
-        fi
+        echo "[$dir_name] 需要同步 $file_count 个文件"
 
         log_info "更新远程仓库版本: $dir_name" "SYNC_DIR"
         update_remote_repository_fast "$remote_target_dir" "$dir_name" "$unique_files" "$local_hash" "$current_branch"
