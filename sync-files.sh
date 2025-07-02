@@ -543,9 +543,6 @@ function detect_file_changes_fast() {
         if ! git merge-base --is-ancestor HEAD "$remote_branch" 2>/dev/null; then
             unpushed_files=$(git diff --name-only "$remote_branch..HEAD" 2>/dev/null || echo "")
         fi
-    elif [ -n "$current_branch" ]; then
-        # 远程分支不存在，快速获取已跟踪文件（限制数量提升性能）
-        unpushed_files=$(git ls-files --cached 2>/dev/null | head -100)
     fi
 
     # 处理删除文件，添加DEL:前缀
@@ -556,6 +553,29 @@ function detect_file_changes_fast() {
 
     # 合并所有文件变更
     local all_files="$modified_files"$'\n'"$staged_files"$'\n'"$untracked_files"$'\n'"$unpushed_files"$'\n'"$deleted_files_with_prefix"
+    # 调试：打印各个文件变更类型的值
+    if [ "$DEBUG_MODE" = "true" ]; then
+        echo "=== 文件变更检测调试信息 ==="
+        echo "modified_files:"
+        echo "$modified_files"
+        echo "---"
+        echo "staged_files:"
+        echo "$staged_files"
+        echo "---"
+        echo "untracked_files:"
+        echo "$untracked_files"
+        echo "---"
+        echo "unpushed_files:"
+        echo "$unpushed_files"
+        echo "---"
+        echo "deleted_files_with_prefix:"
+        echo "$deleted_files_with_prefix"
+        echo "---"
+        echo "all_files (合并后):"
+        echo "$all_files"
+        echo "========================="
+    fi
+
     local unique_files=$(echo "$all_files" | grep -v '^$' | sort -u)
 
     # 缓存结果
@@ -768,36 +788,20 @@ function sync_files() {
         # 使用优化的文件变更检测
         log_info "检测文件变更: $dir_name" "SYNC_DIR"
         local unique_files
-        if [ "$PERFORMANCE_MODE" = "true" ]; then
-            unique_files=$(detect_file_changes_fast "$local_dir")
+        unique_files=$(detect_file_changes_fast "$local_dir")
+        # 调试：打印unique_files的内容
+        if [ -n "$unique_files" ]; then
+            log_info "unique_files内容:" "SYNC_DEBUG"
+            echo "=== unique_files 内容 ==="
+            echo "$unique_files"
+            echo "========================="
         else
-            # 原有的详细检测逻辑（用于调试或特殊情况）
-            local deleted_files_working=$(git diff --name-only --diff-filter=D 2>/dev/null)
-            local deleted_files_staged=$(git diff --cached --name-only --diff-filter=D 2>/dev/null)
-            local deleted_files="$deleted_files_working"$'\n'"$deleted_files_staged"
-            deleted_files=$(echo "$deleted_files" | grep -v '^$' | sort -u)
-
-            local modified_files=$(git diff --name-only --diff-filter=AM 2>/dev/null)
-            local staged_files=$(git diff --cached --name-only --diff-filter=AM 2>/dev/null)
-            local untracked_files=$(git ls-files --others --exclude-standard 2>/dev/null)
-
-            local unpushed_files=""
-            local remote_branch="origin/$current_branch"
-            if git rev-parse --verify "$remote_branch" >/dev/null 2>&1; then
-                if ! git merge-base --is-ancestor HEAD "$remote_branch" 2>/dev/null; then
-                    unpushed_files=$(git diff --name-only "$remote_branch..HEAD" 2>/dev/null || echo "")
-                fi
-            else
-                unpushed_files=$(git ls-files 2>/dev/null || echo "")
-            fi
-
-            local deleted_files_with_prefix=""
-            if [ -n "$deleted_files" ]; then
-                deleted_files_with_prefix=$(echo "$deleted_files" | sed 's/^/DEL:/')
-            fi
-
-            local all_files="$modified_files"$'\n'"$staged_files"$'\n'"$untracked_files"$'\n'"$unpushed_files"$'\n'"$deleted_files_with_prefix"
-            unique_files=$(echo "$all_files" | grep -v '^$' | sort -u)
+            log_info "unique_files为空" "SYNC_DEBUG"
+            echo "unique_files为空"
+        fi
+        local deleted_files_with_prefix=""
+        if [ -n "$deleted_files" ]; then
+            deleted_files_with_prefix=$(echo "$deleted_files" | sed 's/^/DEL:/')
         fi
 
         # 调试信息（仅在非性能模式下显示）
@@ -866,6 +870,7 @@ function sync_files() {
             rsync_args+=("$local_dir/" "$remote_target")
 
             log_info "执行rsync同步: $dir_name -> $remote_target" "SYNC_DIR"
+            log_info "${rsync_args[@]}" "SYNC_DIR"
             if rsync "${rsync_args[@]}" >/dev/null 2>&1; then
                 output_status "SUCCESS" "$dir_name"
                 log_info "文件同步成功: $dir_name" "SYNC_DIR"
