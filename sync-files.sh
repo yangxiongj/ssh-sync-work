@@ -607,7 +607,9 @@ function update_remote_repository_fast() {
 # 安全函数：验证路径
 function validate_path() {
     local path="$1"
-    [[ "$path" =~ \.\./|^\.|[\;\|\&\$\`]|//|^/etc/|^/boot/|^/sys/|^/proc/|^/dev/ ]] && return 1
+    # 阻止危险路径，但允许正常的隐藏文件（如 .env.webui）
+    # 修改正则表达式：^\.\./|^\./| 只匹配 ../ 和 ./ 开头的路径，不匹配普通隐藏文件
+    [[ "$path" =~ ^\.\./|^\./|[\;\|\&\$\`]|//|^/etc/|^/boot/|^/sys/|^/proc/|^/dev/ ]] && return 1
     return 0
 }
 
@@ -804,6 +806,7 @@ function sync_files() {
                     if [[ "$file" =~ ^DEL: ]]; then
                         continue
                     fi
+                    # 打印正在处理的文件
                     include_args+="--include=$(escape_shell_arg "$file") "
                     local dir_path=$(dirname "$file")
                     local depth=0
@@ -833,7 +836,7 @@ function sync_files() {
             rsync_args+=("$local_dir/" "$remote_target")
 
             log_info "执行rsync同步: $dir_name -> $remote_target" "SYNC_DIR"
-            log_info "${rsync_args[@]}" "SYNC_DIR"
+            log_info "rsync命令: rsync ${rsync_args[*]}" "SYNC_DIR"
             if rsync "${rsync_args[@]}" >/dev/null 2>&1; then
                 output_status "SUCCESS" "$dir_name"
                 log_info "文件同步成功: $dir_name" "SYNC_DIR"

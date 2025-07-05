@@ -444,78 +444,99 @@ function need_to_process_changes() {
     write_log "DEBUG" "检查是否需要处理工作区变更 - 已修改文件: $modified_files" "SYNC_DEBUG"
     write_log "DEBUG" "检查是否需要处理工作区变更 - 未跟踪文件: $untracked_files" "SYNC_DEBUG"
     
-    # 检查已修改文件
+    # 合并所有工作区变更文件
+    local all_changed_files=""
     if [ -n "$modified_files" ]; then
-        while IFS= read -r file; do
-            if [ -n "$file" ]; then
-                write_log "DEBUG" "检查已修改文件: $file" "SYNC_DEBUG"
-                
-                # 检查文件是否在同步列表中
-                local in_sync_list=false
-                if [ -n "$sync_files" ]; then
-                    # 逐行检查同步文件列表
-                    while IFS= read -r sync_file; do
-                        if [ -n "$sync_file" ] && [ "$sync_file" = "$file" ]; then
-                            in_sync_list=true
-                            write_log "INFO" "已修改文件在同步列表中: $file = $sync_file" "SYNC_DEBUG"
-                            break
-                        fi
-                    done <<< "$sync_files"
-                fi
-                
-                # 检查排除模式
-                local is_excluded=false
-                if [ -n "$exclude_patterns" ] && echo "$file" | grep -E "$exclude_patterns" >/dev/null 2>&1; then
-                    is_excluded=true
-                    write_log "DEBUG" "已修改文件匹配排除模式: $file" "SYNC_DEBUG"
-                fi
-                
-                # 如果文件不在同步列表中且不匹配排除模式，需要处理
-                if [ "$in_sync_list" = false ] && [ "$is_excluded" = false ]; then
-                    write_log "DEBUG" "需要处理的已修改文件: $file" "SYNC"
-                    return 0  # 需要处理
-                fi
-            fi
-        done <<< "$modified_files"
+        all_changed_files="$modified_files"
     fi
-    
-    # 检查未跟踪文件
     if [ -n "$untracked_files" ]; then
-        while IFS= read -r file; do
-            if [ -n "$file" ]; then
-                write_log "DEBUG" "检查未跟踪文件: $file" "SYNC_DEBUG"
-                
-                # 检查文件是否在同步文件列表中
-                local in_sync_list=false
-                if [ -n "$sync_files" ]; then
-                    # 逐行检查同步文件列表
-                    while IFS= read -r sync_file; do
-                        if [ -n "$sync_file" ] && [ "$sync_file" = "$file" ]; then
-                            in_sync_list=true
-                            write_log "DEBUG" "未跟踪文件在同步列表中: $file = $sync_file" "SYNC_DEBUG"
-                            break
-                        fi
-                    done <<< "$sync_files"
-                fi
-                
-                # 检查排除模式
-                local is_excluded=false
-                if [ -n "$exclude_patterns" ] && echo "$file" | grep -E "$exclude_patterns" >/dev/null 2>&1; then
-                    is_excluded=true
-                    write_log "DEBUG" "未跟踪文件匹配排除模式: $file" "SYNC_DEBUG"
-                fi
-                
-                # 如果文件不在同步列表中且不匹配排除模式，需要处理
-                if [ "$in_sync_list" = false ] && [ "$is_excluded" = false ]; then
-                    write_log "DEBUG" "需要处理的未跟踪文件: $file" "SYNC"
-                    return 0  # 需要处理
-                fi
-            fi
-        done <<< "$untracked_files"
+        if [ -n "$all_changed_files" ]; then
+            all_changed_files="$all_changed_files"$'\n'"$untracked_files"
+        else
+            all_changed_files="$untracked_files"
+        fi
     fi
     
-    write_log "INFO" "无需处理工作区变更" "SYNC_DEBUG"
-    return 1  # 不需要处理
+    # 如果没有工作区变更，不需要处理
+    if [ -z "$all_changed_files" ]; then
+        write_log "INFO" "没有工作区变更，无需处理" "SYNC_DEBUG"
+        return 1  # 不需要处理
+    fi
+    
+    # 如果没有同步文件列表，说明客户端没有变更，但服务器有变更，需要处理
+    if [ -z "$sync_files" ]; then
+        write_log "DEBUG" "客户端无变更但服务器有变更，需要处理" "SYNC"
+        return 0  # 需要处理
+    fi
+    
+    # 比较工作区变更文件和同步文件列表是否一致
+    # 使用集合运算：如果 (工作区文件 - 排除文件) 和 同步文件列表 完全一致，则不需要处理
+    
+    # 创建临时文件
+    local temp_changed=$(mktemp)
+    local temp_sync=$(mktemp)
+    local temp_excluded=$(mktemp)
+    
+    # 写入工作区变更文件并排序
+    echo "$all_changed_files" | sort -u > "$temp_changed"
+    
+    # 写入同步文件列表并排序
+    echo "$sync_files" | sort -u > "$temp_sync"
+    
+    # 计算排除的文件列表
+    if [ -n "$exclude_patterns" ]; then
+        echo "$all_changed_files" | grep -E "$exclude_patterns" | sort -u > "$temp_excluded" 2>/dev/null || touch "$temp_excluded"
+    else
+        touch "$temp_excluded"
+    fi
+    
+    # 计算工作区变更文件去除排除文件后的结果
+    local temp_changed_filtered=$(mktemp)
+    comm -23 "$temp_changed" "$temp_excluded" > "$temp_changed_filtered"
+    
+    # 调试：记录计算过程
+    write_log "DEBUG" "工作区变更文件: $(cat "$temp_changed" | tr '\n' ' ')" "SYNC_DEBUG"
+    write_log "DEBUG" "同步文件列表: $(cat "$temp_sync" | tr '\n' ' ')" "SYNC_DEBUG"
+    write_log "DEBUG" "排除文件: $(cat "$temp_excluded" | tr '\n' ' ')" "SYNC_DEBUG"
+    write_log "DEBUG" "过滤后的工作区文件: $(cat "$temp_changed_filtered" | tr '\n' ' ')" "SYNC_DEBUG"
+    
+    # 计算详细的差异分析
+    local temp_missing=$(mktemp)
+    local temp_extra=$(mktemp)
+    
+    # 计算缺少的文件：同步列表中有但工作区变更中没有的文件
+    comm -23 "$temp_sync" "$temp_changed_filtered" > "$temp_missing"
+    
+    # 计算多余的文件：工作区变更中有但同步列表中没有的文件
+    comm -13 "$temp_sync" "$temp_changed_filtered" > "$temp_extra"
+    
+    # 记录差异详情
+    local missing_files=$(cat "$temp_missing" | tr '\n' ' ')
+    local extra_files=$(cat "$temp_extra" | tr '\n' ' ')
+    
+    if [ -n "$missing_files" ]; then
+        write_log "DEBUG" "同步列表中有但工作区没有变更的文件: $missing_files" "SYNC_DEBUG"
+    fi
+    if [ -n "$extra_files" ]; then
+        write_log "DEBUG" "工作区有变更但不在同步列表中的文件: $extra_files" "SYNC_DEBUG"
+    fi
+    
+    # 比较过滤后的工作区文件和同步文件列表是否完全一致
+    if cmp -s "$temp_changed_filtered" "$temp_sync"; then
+        write_log "INFO" "工作区变更与同步文件列表完全一致，无需处理" "SYNC_DEBUG"
+        local result=1  # 不需要处理
+    else
+        write_log "DEBUG" "工作区变更与同步文件列表不一致，需要处理" "SYNC"
+        local result=0  # 需要处理
+    fi
+    
+    # 清理差异分析临时文件
+    rm -f "$temp_missing" "$temp_extra"
+    
+    # 清理临时文件
+    rm -f "$temp_changed" "$temp_sync" "$temp_excluded" "$temp_changed_filtered"
+    
+    return $result
 }
 
 # 处理工作区变更
